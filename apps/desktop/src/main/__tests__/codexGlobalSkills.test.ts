@@ -29,6 +29,33 @@ async function writeSkill(skillsDir: string, name: string): Promise<void> {
   );
 }
 
+async function writeInstalledGhostSkill(
+  ownerRoot: string,
+  ghostId: string,
+  item: { dir: string; name: string },
+): Promise<string> {
+  const ghostDir = path.join(ownerRoot, 'cindy-brain', ghostId);
+  const skillDir = path.join(ghostDir, ...item.dir.split('/'));
+  await writeSkill(path.dirname(skillDir), path.basename(skillDir));
+  await fs.writeFile(
+    path.join(ghostDir, 'ghost.json'),
+    JSON.stringify({
+      schemaVersion: 2,
+      id: ghostId,
+      name: ghostId,
+      version: '1.0.0',
+      kind: 'chip',
+      entry: 'main.js',
+      slots: ['skill'],
+      skill: {
+        items: [{ ...item, description: 'test skill' }],
+      },
+    }),
+    'utf8',
+  );
+  return skillDir;
+}
+
 async function sameRealPath(a: string, b: string): Promise<boolean> {
   const [ra, rb] = await Promise.all([fs.realpath(a), fs.realpath(b)]);
   const normalize = (value: string) =>
@@ -56,31 +83,43 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     const ownerASkill = path.join(ownerARoot, 'cindy-brain', 'ghost-a', 'skills', 'profile-a');
     const ownerBSkill = path.join(ownerBRoot, 'cindy-brain', 'ghost-b', 'skills', 'profile-b');
     const ownerALegacySkill = path.join(ownerARoot, 'brain', 'ghost-old', 'skills', 'legacy-a');
+    const ownerANonstandardSkill = path.join(
+      ownerARoot,
+      'cindy-brain',
+      'ghost-custom',
+      'agent-skills',
+      'custom-a',
+    );
     const ownerALink = path.join(agentsSkills, 'ghost-a--profile-a');
     const ownerBLink = path.join(agentsSkills, 'ghost-b--profile-b');
     const ownerALegacyLink = path.join(agentsSkills, 'ghost-old--legacy-a');
+    const ownerANonstandardLink = path.join(agentsSkills, 'ghost-custom--custom-a');
     const globalSkill = path.join(agentsSkills, 'humanizer-zh');
 
     await writeSkill(path.dirname(ownerASkill), path.basename(ownerASkill));
     await writeSkill(path.dirname(ownerBSkill), path.basename(ownerBSkill));
     await writeSkill(path.dirname(ownerALegacySkill), path.basename(ownerALegacySkill));
+    await writeSkill(path.dirname(ownerANonstandardSkill), path.basename(ownerANonstandardSkill));
     await writeSkill(agentsSkills, 'humanizer-zh');
     await linkDirectory(ownerASkill, ownerALink);
     await linkDirectory(ownerBSkill, ownerBLink);
     await linkDirectory(ownerALegacySkill, ownerALegacyLink);
+    await linkDirectory(ownerANonstandardSkill, ownerANonstandardLink);
 
     const reportedSkills = [
       { path: path.join(ownerALink, 'SKILL.md') },
       { path: path.join(ownerBLink, 'SKILL.md') },
       { path: path.join(ownerALegacyLink, 'SKILL.md') },
+      { path: path.join(ownerANonstandardLink, 'SKILL.md') },
       { path: path.join(globalSkill, 'SKILL.md') },
     ];
-    await expect(codexDisabledSkillPathsForOwner(reportedSkills, ownerBRoot)).resolves.toEqual([
-      path.join(ownerALink, 'SKILL.md'),
-      path.join(ownerALegacyLink, 'SKILL.md'),
-    ]);
+    await expect(codexDisabledSkillPathsForOwner(reportedSkills, ownerBRoot)).resolves.toEqual(
+      [ownerALink, ownerALegacyLink, ownerANonstandardLink]
+        .map((link) => path.join(link, 'SKILL.md'))
+        .sort(),
+    );
     await expect(codexDisabledSkillPathsForOwner(reportedSkills)).resolves.toEqual(
-      [ownerALink, ownerALegacyLink, ownerBLink]
+      [ownerALink, ownerALegacyLink, ownerANonstandardLink, ownerBLink]
         .map((link) => path.join(link, 'SKILL.md'))
         .sort(),
     );
@@ -155,6 +194,35 @@ describe('prepareCodexGlobalSkillsLinks', () => {
 
     const repeated = await prepareCodexGlobalSkillsLinks(codexHome, { homeDir, ownerRoot: ownerBRoot });
     expect(repeated.changed).toBe(false);
+  });
+
+  it('projects the current owner copy when another Profile occupies the shared link name', async () => {
+    const root = await makeTmpDir();
+    const homeDir = path.join(root, 'home');
+    const codexHome = path.join(root, 'xdt-codex-home');
+    const agentsSkills = path.join(homeDir, '.agents', 'skills');
+    const ownerARoot = path.join(root, 'user-data-a', 'owners', 'owner-a');
+    const ownerBRoot = path.join(root, 'user-data-b', 'owners', 'owner-b');
+    const item = { dir: 'agent-skills/shared', name: 'shared' };
+    const ownerASkill = await writeInstalledGhostSkill(ownerARoot, 'same-ghost', item);
+    const ownerBSkill = await writeInstalledGhostSkill(ownerBRoot, 'same-ghost', item);
+    const sharedLink = path.join(agentsSkills, 'same-ghost--shared');
+    await linkDirectory(ownerASkill, sharedLink);
+
+    const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+    const result = await prepareCodexGlobalSkillsLinks(codexHome, {
+      homeDir,
+      ownerRoot: ownerBRoot,
+    });
+
+    expect(result.warnings).toEqual([]);
+    expect(await sameRealPath(sharedLink, ownerASkill)).toBe(true);
+    expect(
+      await sameRealPath(
+        path.join(paths.sharedAgentsSkillsLink, 'same-ghost--shared'),
+        ownerBSkill,
+      ),
+    ).toBe(true);
   });
 
   it('links legacy Codex skills and projects shared agent skills under custom CODEX_HOME', async () => {

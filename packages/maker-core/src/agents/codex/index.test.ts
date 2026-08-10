@@ -941,6 +941,47 @@ describe('CodexAgent capability routing', () => {
     await handle.close();
   });
 
+  it('fails closed for host-disabled Skill paths reported only as catalog errors', async () => {
+    const brokenForeignSkillPath =
+      '/profiles/a/owners/owner-a/cindy-brain/ghost-a/agent-skills/profile-a/SKILL.md';
+    const reportedSkills = [{ path: brokenForeignSkillPath, enabled: true }];
+    const resolveCodexDisabledSkillPaths = vi.fn(async () => [brokenForeignSkillPath]);
+    const agent = new CodexAgent(createDeps({}, { resolveCodexDisabledSkillPaths }));
+    const host = installFakeHost(
+      agent,
+      (method, params) => {
+        if (method !== Method.SkillsList) return undefined;
+        const { cwds = ['/repo'] } = params as { cwds?: string[] };
+        return {
+          data: cwds.map((cwd) => ({
+            cwd,
+            skills: [],
+            errors: [{ path: brokenForeignSkillPath, message: 'invalid metadata' }],
+          })),
+        };
+      },
+      { userAgent: 'mock-codex/0.145.0' },
+    );
+
+    const handle = await agent.startSession({
+      sessionId: 'session-owner-filtered-broken-skill',
+      model: 'gpt-5.4',
+      workingDir: '/repo',
+    });
+    const startParams = host.request.mock.calls.find(
+      ([method]) => method === Method.ThreadStart,
+    )?.[1] as { config?: Record<string, unknown> };
+    expect(startParams.config).toMatchObject({
+      'skills.config': [{ path: brokenForeignSkillPath, enabled: false }],
+    });
+    expect(resolveCodexDisabledSkillPaths).toHaveBeenCalledWith({
+      workingDir: '/repo',
+      skills: reportedSkills,
+    });
+
+    await handle.close();
+  });
+
   it('resolves workspace routing once from the frozen session context', async () => {
     const resolveCapabilityRouting = vi.fn(() => ({
       overrides: [

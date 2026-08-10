@@ -3811,28 +3811,32 @@ export class CodexAgent extends BaseAgent {
           CRITICAL_THREAD_RPC_TIMEOUT_MS,
         );
         assertCurrentHost('capability Skill discovery');
+        const discoveredSkills = [
+          ...skills,
+          // Catalog errors can still expose the concrete SKILL.md path. Keep
+          // those entries in every fail-closed policy, including host owner
+          // isolation, instead of only applying them to capability routing.
+          ...errors.flatMap((error) =>
+            error.path ? [{ path: error.path, enabled: true }] : [],
+          ),
+        ];
         if (requiresCodexCapabilitySkillDiscovery(capabilityRoutingPolicy)) {
           capabilityRoutingConfig = {
             ...capabilityRoutingConfig,
-            ...buildCodexCapabilitySkillConfigOverrides(capabilityRoutingPolicy, [
-              ...skills,
-              // A malformed restricted Skill may be absent from `skills` while
-              // its concrete SKILL.md path is still reported here. Disable that
-              // path too instead of failing open on a catalog parse error.
-              ...errors.flatMap((error) =>
-                error.path ? [{ path: error.path, enabled: true }] : [],
-              ),
-            ]),
+            ...buildCodexCapabilitySkillConfigOverrides(
+              capabilityRoutingPolicy,
+              discoveredSkills,
+            ),
           };
         }
         if (resolveHostDisabledSkillPaths) {
           const hostDisabledPaths = await resolveHostDisabledSkillPaths({
             workingDir: opts.workingDir,
-            skills,
+            skills: discoveredSkills,
           });
           capabilityRoutingConfig = mergeHostDisabledSkillConfig(
             capabilityRoutingConfig,
-            skills,
+            discoveredSkills,
             hostDisabledPaths,
           );
         }

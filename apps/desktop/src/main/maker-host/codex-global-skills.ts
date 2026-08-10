@@ -1,7 +1,13 @@
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { promises as fsp } from 'node:fs';
+import { promises as fsp, type Dirent } from 'node:fs';
+
+import {
+  GHOST_INSTALL_MANIFEST_MAX_BYTES,
+  GHOST_MANIFEST_FILE,
+  validateGhostManifest,
+} from '../../shared/ghost.js';
 
 import {
   ensureDirectoryLink,
@@ -46,18 +52,103 @@ interface ProjectionEntry {
   target: string;
 }
 
-function targetLooksGhostRepositoryManaged(target: string): boolean {
+const GHOST_DISABLED_MARKER_FILE = '.disabled';
+
+async function pathExists(pathname: string): Promise<boolean> {
+  try {
+    await fsp.access(pathname);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw err;
+  }
+}
+
+function ghostIdFromLinkName(linkName: string | undefined): string | null {
+  if (!linkName) return null;
+  const separator = linkName.lastIndexOf('--');
+  return separator > 0 ? linkName.slice(0, separator).toLowerCase() : null;
+}
+
+function targetLooksGhostRepositoryManaged(target: string, linkName?: string): boolean {
   const segments = target.split(/[\\/]/).map((segment) => segment.toLowerCase());
-  return segments.some(
-    (segment, index) =>
-      (segment === 'cindy-brain' || segment === 'brain') && segments[index + 2] === 'skills',
-  );
+  const expectedGhostId = ghostIdFromLinkName(linkName);
+  return segments.some((segment, index) => {
+    if (segment !== 'cindy-brain' && segment !== 'brain') return false;
+    const actualGhostId = segments[index + 1];
+    return Boolean(actualGhostId) && (!expectedGhostId || actualGhostId === expectedGhostId);
+  });
 }
 
 function targetLooksGhostManaged(target: string, linkName: string): boolean {
-  // 与 skillSlot 的保守判据保持一致，避免把普通用户链接误判成 Ghost 托管链接。
-  if (!linkName.includes('--')) return false;
-  return targetLooksGhostRepositoryManaged(target);
+  // 与 skillSlot 使用同一归属思路：链接名提供 ghost id，目标只需落在
+  // cindy-brain/<id> 或 legacy brain/<id> 下，不假设插件内部一定使用 skills/。
+  return (
+    ghostIdFromLinkName(linkName) !== null &&
+    targetLooksGhostRepositoryManaged(target, linkName)
+  );
+}
+
+function managedLinkNameFromSkillPath(skillPath: string): string | undefined {
+  return skillPath
+    .split(/[\\/]/)
+    .find((segment) => ghostIdFromLinkName(segment) !== null);
+}
+
+async function collectOwnerInstalledGhostSkills(ownerRoot?: string): Promise<ProjectionEntry[]> {
+  if (!ownerRoot) return [];
+  const entries = new Map<string, ProjectionEntry>();
+
+  for (const repositoryName of ['cindy-brain', 'brain']) {
+    const repositoryRoot = path.join(ownerRoot, repositoryName);
+    const repositoryRootCompare =
+      (await realPathOrNull(repositoryRoot)) ?? normalizeForCompare(repositoryRoot);
+    let ghostDirs: Dirent[];
+    try {
+      ghostDirs = await fsp.readdir(repositoryRoot, { withFileTypes: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw err;
+    }
+
+    for (const ghostEntry of ghostDirs.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (!ghostEntry.isDirectory() || ghostEntry.name.startsWith('.')) continue;
+      const ghostDir = path.join(repositoryRoot, ghostEntry.name);
+      const manifestPath = path.join(ghostDir, GHOST_MANIFEST_FILE);
+      try {
+        const stat = await fsp.lstat(manifestPath);
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.size > GHOST_INSTALL_MANIFEST_MAX_BYTES) {
+          continue;
+        }
+        if (await pathExists(path.join(ghostDir, GHOST_DISABLED_MARKER_FILE))) continue;
+        const manifestText = await fsp.readFile(manifestPath, 'utf8');
+        if (Buffer.byteLength(manifestText, 'utf8') > GHOST_INSTALL_MANIFEST_MAX_BYTES) continue;
+        const validation = validateGhostManifest(JSON.parse(manifestText));
+        if (!validation.ok || validation.manifest.id !== ghostEntry.name) continue;
+        const manifest = validation.manifest;
+        if (!manifest.slots.includes('skill') || !manifest.skill) continue;
+
+        for (const item of manifest.skill.items) {
+          const targetPath = path.join(ghostDir, ...item.dir.split('/'));
+          const target = await realPathOrNull(targetPath);
+          if (
+            !target ||
+            !isSameOrInside(target, repositoryRootCompare) ||
+            !(await isDirectory(targetPath))
+          ) {
+            continue;
+          }
+          const name = `${manifest.id}--${item.name}`;
+          if (!entries.has(name)) entries.set(name, { name, target });
+        }
+      } catch {
+        // A damaged installed Ghost must not make the projection fail open.
+        continue;
+      }
+    }
+  }
+
+  return [...entries.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /**
@@ -75,7 +166,9 @@ export async function codexDisabledSkillPathsForOwner(
 
   for (const skill of skills) {
     const target = (await realPathOrNull(skill.path)) ?? normalizeForCompare(skill.path);
-    if (!targetLooksGhostRepositoryManaged(target)) continue;
+    if (!targetLooksGhostRepositoryManaged(target, managedLinkNameFromSkillPath(skill.path))) {
+      continue;
+    }
     if (!ownerRootCompare || !isSameOrInside(target, ownerRootCompare)) {
       disabled.push(skill.path);
     }
@@ -95,7 +188,7 @@ async function collectOwnerVisibleAgentSkills(
     ? ((await realPathOrNull(ownerRoot)) ?? normalizeForCompare(ownerRoot))
     : null;
   const entries = await fsp.readdir(sharedSkillsDir, { withFileTypes: true });
-  const visible: ProjectionEntry[] = [];
+  const visible = new Map<string, ProjectionEntry>();
 
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
     const sourcePath = path.join(sharedSkillsDir, entry.name);
@@ -104,10 +197,20 @@ async function collectOwnerVisibleAgentSkills(
 
     const isGhostLink = entry.isSymbolicLink() && targetLooksGhostManaged(target, entry.name);
     if (isGhostLink && (!ownerRootCompare || !isSameOrInside(target, ownerRootCompare))) continue;
-    visible.push({ name: entry.name, target });
+    visible.set(entry.name, { name: entry.name, target });
   }
 
-  return visible;
+  for (const ownerEntry of await collectOwnerInstalledGhostSkills(ownerRoot)) {
+    const existing = visible.get(ownerEntry.name);
+    // Preserve an unmanaged user entry on collision, matching skillSlot's
+    // no-clobber rule. A managed link may be replaced inside this private
+    // projection without mutating the cross-profile shared root.
+    if (!existing || targetLooksGhostManaged(existing.target, existing.name)) {
+      visible.set(ownerEntry.name, ownerEntry);
+    }
+  }
+
+  return [...visible.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function projectionSignature(entries: ProjectionEntry[]): string {
