@@ -125,6 +125,43 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     );
   });
 
+  it('ignores unrelated ancestor directories containing a managed-link separator', async () => {
+    const root = await makeTmpDir();
+    const misleadingHome = path.join(root, 'home--not-a-ghost-link');
+    const agentsSkills = path.join(misleadingHome, '.agents', 'skills');
+    const ownerARoot = path.join(root, 'user-data-a', 'owners', 'owner-a');
+    const ownerBRoot = path.join(root, 'user-data-b', 'owners', 'owner-b');
+    const ownerASkill = path.join(
+      ownerARoot,
+      'cindy-brain',
+      'ghost-a',
+      'agent-skills',
+      'profile-a',
+    );
+    const ownerALink = path.join(agentsSkills, 'ghost-a--profile-a');
+    const projectedOwnerALink = path.join(
+      misleadingHome,
+      'codex-home',
+      'skills',
+      CODEX_SHARED_AGENTS_SKILLS_LINK_NAME,
+      'ghost-a--profile-a',
+    );
+    await writeSkill(path.dirname(ownerASkill), path.basename(ownerASkill));
+    await linkDirectory(ownerASkill, ownerALink);
+    await linkDirectory(ownerASkill, projectedOwnerALink);
+
+    await expect(
+      codexDisabledSkillPathsForOwner(
+        [ownerALink, projectedOwnerALink].map((link) => ({
+          path: path.join(link, 'SKILL.md'),
+        })),
+        ownerBRoot,
+      ),
+    ).resolves.toEqual(
+      [ownerALink, projectedOwnerALink].map((link) => path.join(link, 'SKILL.md')).sort(),
+    );
+  });
+
   it('upgrades the legacy shared-root bridge to an owner-filtered projection', async () => {
     const root = await makeTmpDir();
     const homeDir = path.join(root, 'home');

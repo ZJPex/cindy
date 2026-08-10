@@ -750,12 +750,11 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
   private lastKnownCodexCredentialScope: AuthState['credentialScope'] = undefined;
 
   /**
-   * 进行中的 ensureGlobalCodexAssets 调用 —— 同一时刻并发进入直接复用同一 Promise,
-   * 避免重复 stat / copy。每次 codex session start 都会过一遍 getAuthEnv → ensure,
-   * 没有缓存时连续启动会触发并发竞态 (功能正确但浪费 io)。结束后置 null 不做长期缓存,
-   * 因为源文件 (~/.codex/AGENTS.md) 随时可能被用户改, 仍需要后续调用触发新一轮检查。
+   * 进行中的 ensureGlobalCodexAssets 调用。同一 owner 复用一次准备；owner 切换时将新准备
+   * 串在旧准备之后，避免两个 Profile 并发改写同一个 CODEX_HOME 投影。结束后不长期缓存，
+   * 因为源文件 (~/.codex/AGENTS.md) 随时可能被用户修改。
    */
-  private pendingAssetsPrep: Promise<void> | null = null;
+  private pendingAssetsPrep: { ownerScopeKey: string; promise: Promise<void> } | null = null;
 
   /**
    * 进行中的 reconcileWithSystemCodex 调用 —— 多个调用点 (构造 / getState / getAuthEnv /
@@ -1048,14 +1047,23 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
   }
 
   async ensureGlobalCodexAssets(): Promise<void> {
-    if (this.pendingAssetsPrep) return this.pendingAssetsPrep;
-    this.pendingAssetsPrep = this.runEnsureGlobalCodexAssets().finally(() => {
-      this.pendingAssetsPrep = null;
+    const ownerScopeKey = activeOwnerScopeKey();
+    const ownerRoot = ownerScopedUserDataPath();
+    const current = this.pendingAssetsPrep;
+    if (current?.ownerScopeKey === ownerScopeKey) return current.promise;
+
+    const start = current
+      ? current.promise.catch(() => undefined).then(() => this.runEnsureGlobalCodexAssets(ownerRoot))
+      : this.runEnsureGlobalCodexAssets(ownerRoot);
+    const pending = { ownerScopeKey, promise: start };
+    pending.promise = start.finally(() => {
+      if (this.pendingAssetsPrep === pending) this.pendingAssetsPrep = null;
     });
-    return this.pendingAssetsPrep;
+    this.pendingAssetsPrep = pending;
+    return pending.promise;
   }
 
-  private async runEnsureGlobalCodexAssets(): Promise<void> {
+  private async runEnsureGlobalCodexAssets(ownerRoot: string): Promise<void> {
     // Load-bearing order: Codex skill linking scans ~/.agents/skills, so shared
     // links must populate that directory before prepareCodexGlobalSkillsLinks runs.
     const sharedOutcome = await prepareSharedGlobalSkillLinks().then(
@@ -1065,7 +1073,7 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
 
     const [skillsOutcome, rulesOutcome, pluginsOutcome] = await Promise.all([
       prepareCodexGlobalSkillsLinks(this.codexHome, {
-        ownerRoot: ownerScopedUserDataPath(),
+        ownerRoot,
       }).then(
         (r) => ({ ok: true as const, label: 'skills' as const, warnings: r.warnings }),
         (err: Error) => ({ ok: false as const, label: 'skills' as const, err }),

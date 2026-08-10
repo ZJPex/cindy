@@ -90,9 +90,21 @@ function targetLooksGhostManaged(target: string, linkName: string): boolean {
 }
 
 function managedLinkNameFromSkillPath(skillPath: string): string | undefined {
-  return skillPath
-    .split(/[\\/]/)
-    .find((segment) => ghostIdFromLinkName(segment) !== null);
+  const segments = skillPath.split(/[\\/]/).filter(Boolean);
+  const normalized = segments.map((segment) => segment.toLowerCase());
+
+  for (let index = segments.length - 2; index >= 0; index -= 1) {
+    const isSharedAgentsBridge =
+      normalized[index] === CODEX_SHARED_AGENTS_SKILLS_LINK_NAME.toLowerCase();
+    const isNativeAgentsRoot =
+      normalized[index] === 'skills' && normalized[index - 1] === '.agents';
+    if (!isSharedAgentsBridge && !isNativeAgentsRoot) continue;
+
+    const candidate = segments[index + 1];
+    if (ghostIdFromLinkName(candidate) !== null) return candidate;
+  }
+
+  return undefined;
 }
 
 async function collectOwnerInstalledGhostSkills(ownerRoot?: string): Promise<ProjectionEntry[]> {
