@@ -110,53 +110,55 @@ function managedLinkNameFromSkillPath(skillPath: string): string | undefined {
 async function collectOwnerInstalledGhostSkills(ownerRoot?: string): Promise<ProjectionEntry[]> {
   if (!ownerRoot) return [];
   const entries = new Map<string, ProjectionEntry>();
+  const activeRepositoryRoot = path.join(ownerRoot, 'cindy-brain');
+  // 与 Ghost 运行时的迁移结果保持一致：新旧目录并存时只认新目录；只有旧目录时
+  // 继续兼容迁移失败后的 legacy 根，不能把两个安装清单合并成一个可见集合。
+  const repositoryRoot = (await pathExists(activeRepositoryRoot))
+    ? activeRepositoryRoot
+    : path.join(ownerRoot, 'brain');
+  const repositoryRootCompare =
+    (await realPathOrNull(repositoryRoot)) ?? normalizeForCompare(repositoryRoot);
+  let ghostDirs: Dirent[];
+  try {
+    ghostDirs = await fsp.readdir(repositoryRoot, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw err;
+  }
 
-  for (const repositoryName of ['cindy-brain', 'brain']) {
-    const repositoryRoot = path.join(ownerRoot, repositoryName);
-    const repositoryRootCompare =
-      (await realPathOrNull(repositoryRoot)) ?? normalizeForCompare(repositoryRoot);
-    let ghostDirs: Dirent[];
+  for (const ghostEntry of ghostDirs.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!ghostEntry.isDirectory() || ghostEntry.name.startsWith('.')) continue;
+    const ghostDir = path.join(repositoryRoot, ghostEntry.name);
+    const manifestPath = path.join(ghostDir, GHOST_MANIFEST_FILE);
     try {
-      ghostDirs = await fsp.readdir(repositoryRoot, { withFileTypes: true });
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
-      throw err;
-    }
-
-    for (const ghostEntry of ghostDirs.sort((a, b) => a.name.localeCompare(b.name))) {
-      if (!ghostEntry.isDirectory() || ghostEntry.name.startsWith('.')) continue;
-      const ghostDir = path.join(repositoryRoot, ghostEntry.name);
-      const manifestPath = path.join(ghostDir, GHOST_MANIFEST_FILE);
-      try {
-        const stat = await fsp.lstat(manifestPath);
-        if (!stat.isFile() || stat.isSymbolicLink() || stat.size > GHOST_INSTALL_MANIFEST_MAX_BYTES) {
-          continue;
-        }
-        if (await pathExists(path.join(ghostDir, GHOST_DISABLED_MARKER_FILE))) continue;
-        const manifestText = await fsp.readFile(manifestPath, 'utf8');
-        if (Buffer.byteLength(manifestText, 'utf8') > GHOST_INSTALL_MANIFEST_MAX_BYTES) continue;
-        const validation = validateGhostManifest(JSON.parse(manifestText));
-        if (!validation.ok || validation.manifest.id !== ghostEntry.name) continue;
-        const manifest = validation.manifest;
-        if (!manifest.slots.includes('skill') || !manifest.skill) continue;
-
-        for (const item of manifest.skill.items) {
-          const targetPath = path.join(ghostDir, ...item.dir.split('/'));
-          const target = await realPathOrNull(targetPath);
-          if (
-            !target ||
-            !isSameOrInside(target, repositoryRootCompare) ||
-            !(await isDirectory(targetPath))
-          ) {
-            continue;
-          }
-          const name = `${manifest.id}--${item.name}`;
-          if (!entries.has(name)) entries.set(name, { name, target });
-        }
-      } catch {
-        // A damaged installed Ghost must not make the projection fail open.
+      const stat = await fsp.lstat(manifestPath);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > GHOST_INSTALL_MANIFEST_MAX_BYTES) {
         continue;
       }
+      if (await pathExists(path.join(ghostDir, GHOST_DISABLED_MARKER_FILE))) continue;
+      const manifestText = await fsp.readFile(manifestPath, 'utf8');
+      if (Buffer.byteLength(manifestText, 'utf8') > GHOST_INSTALL_MANIFEST_MAX_BYTES) continue;
+      const validation = validateGhostManifest(JSON.parse(manifestText));
+      if (!validation.ok || validation.manifest.id !== ghostEntry.name) continue;
+      const manifest = validation.manifest;
+      if (!manifest.slots.includes('skill') || !manifest.skill) continue;
+
+      for (const item of manifest.skill.items) {
+        const targetPath = path.join(ghostDir, ...item.dir.split('/'));
+        const target = await realPathOrNull(targetPath);
+        if (
+          !target ||
+          !isSameOrInside(target, repositoryRootCompare) ||
+          !(await isDirectory(targetPath))
+        ) {
+          continue;
+        }
+        const name = `${manifest.id}--${item.name}`;
+        if (!entries.has(name)) entries.set(name, { name, target });
+      }
+    } catch {
+      // A damaged installed Ghost must not make the projection fail open.
+      continue;
     }
   }
 

@@ -972,25 +972,29 @@ function isPaletteVisibleCodexSkill(skill: SkillMetadata): boolean {
   return !/\/plugins\/cache\/[^/]+\/[^/]+\/[^/]+\/skills\//i.test(normalizedPath);
 }
 
+function configuredDisabledSkillPaths(config: Record<string, unknown>): Set<string> {
+  const disabledPaths = new Set<string>();
+  const configured = config['skills.config'];
+  if (!Array.isArray(configured)) return disabledPaths;
+  for (const entry of configured) {
+    if (
+      entry &&
+      typeof entry === 'object' &&
+      typeof (entry as { path?: unknown }).path === 'string' &&
+      (entry as { enabled?: unknown }).enabled === false
+    ) {
+      disabledPaths.add((entry as { path: string }).path);
+    }
+  }
+  return disabledPaths;
+}
+
 function mergeHostDisabledSkillConfig(
   config: Record<string, unknown>,
   skills: ReadonlyArray<{ path: string; enabled: boolean }>,
   hostDisabledPaths: readonly string[],
 ): Record<string, unknown> {
-  const disabledPaths = new Set<string>();
-  const configured = config['skills.config'];
-  if (Array.isArray(configured)) {
-    for (const entry of configured) {
-      if (
-        entry &&
-        typeof entry === 'object' &&
-        typeof (entry as { path?: unknown }).path === 'string' &&
-        (entry as { enabled?: unknown }).enabled === false
-      ) {
-        disabledPaths.add((entry as { path: string }).path);
-      }
-    }
-  }
+  const disabledPaths = configuredDisabledSkillPaths(config);
   for (const skill of skills) {
     if (!skill.enabled) disabledPaths.add(skill.path);
   }
@@ -3933,6 +3937,9 @@ export class CodexAgent extends BaseAgent {
         `Cindy capability routing requires Codex app-server 0.145.0 or newer (current: ${initResp.userAgent ?? 'unknown'})`,
       );
     }
+    // Slash 分派必须与 thread/start 使用同一份冻结策略，不能重新扫描后绕过
+    // owner 隔离或能力兼容禁用。发送热路径只做 Set 查询，不增加 I/O。
+    const sessionDisabledSkillPaths = configuredDisabledSkillPaths(capabilityRoutingConfig);
     // Only the official OpenAI OAuth route uses Codex Guardian. Third-party,
     // gateway and custom-provider routes use the current session model through
     // Cindy's host reviewer; they must never borrow the hidden Guardian model.
@@ -4702,7 +4709,10 @@ export class CodexAgent extends BaseAgent {
       try {
         const { skills } = await this.listSkillsForCwd(opts.workingDir, false);
         const skill = skills.find(
-          (item) => item.enabled && item.name.toLowerCase() === slash.name.toLowerCase(),
+          (item) =>
+            item.enabled &&
+            !sessionDisabledSkillPaths.has(item.path) &&
+            item.name.toLowerCase() === slash.name.toLowerCase(),
         );
         if (!skill) return toAppServerInput(content, opts.workingDir);
 

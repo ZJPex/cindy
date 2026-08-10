@@ -33,8 +33,9 @@ async function writeInstalledGhostSkill(
   ownerRoot: string,
   ghostId: string,
   item: { dir: string; name: string },
+  repositoryName: 'cindy-brain' | 'brain' = 'cindy-brain',
 ): Promise<string> {
-  const ghostDir = path.join(ownerRoot, 'cindy-brain', ghostId);
+  const ghostDir = path.join(ownerRoot, repositoryName, ghostId);
   const skillDir = path.join(ghostDir, ...item.dir.split('/'));
   await writeSkill(path.dirname(skillDir), path.basename(skillDir));
   await fs.writeFile(
@@ -258,6 +259,55 @@ describe('prepareCodexGlobalSkillsLinks', () => {
       await sameRealPath(
         path.join(paths.sharedAgentsSkillsLink, 'same-ghost--shared'),
         ownerBSkill,
+      ),
+    ).toBe(true);
+  });
+
+  it('uses only cindy-brain when the active and legacy install roots coexist', async () => {
+    const root = await makeTmpDir();
+    const homeDir = path.join(root, 'home');
+    const codexHome = path.join(root, 'xdt-codex-home');
+    const agentsSkills = path.join(homeDir, '.agents', 'skills');
+    const ownerRoot = path.join(root, 'user-data', 'owners', 'owner-a');
+    const activeItem = { dir: 'agent-skills/active', name: 'active' };
+    const legacyItem = { dir: 'agent-skills/legacy', name: 'legacy' };
+    const activeSkill = await writeInstalledGhostSkill(ownerRoot, 'active-ghost', activeItem);
+    await writeInstalledGhostSkill(ownerRoot, 'legacy-ghost', legacyItem, 'brain');
+    await writeSkill(agentsSkills, 'user-global');
+
+    const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+    const result = await prepareCodexGlobalSkillsLinks(codexHome, { homeDir, ownerRoot });
+
+    expect(result.warnings).toEqual([]);
+    expect(
+      await sameRealPath(
+        path.join(paths.sharedAgentsSkillsLink, 'active-ghost--active'),
+        activeSkill,
+      ),
+    ).toBe(true);
+    await expect(
+      fs.lstat(path.join(paths.sharedAgentsSkillsLink, 'legacy-ghost--legacy')),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('keeps legacy-only installed Ghost Skills available before root migration succeeds', async () => {
+    const root = await makeTmpDir();
+    const homeDir = path.join(root, 'home');
+    const codexHome = path.join(root, 'xdt-codex-home');
+    const agentsSkills = path.join(homeDir, '.agents', 'skills');
+    const ownerRoot = path.join(root, 'user-data', 'owners', 'owner-a');
+    const item = { dir: 'agent-skills/legacy', name: 'legacy' };
+    const legacySkill = await writeInstalledGhostSkill(ownerRoot, 'legacy-ghost', item, 'brain');
+    await writeSkill(agentsSkills, 'user-global');
+
+    const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+    const result = await prepareCodexGlobalSkillsLinks(codexHome, { homeDir, ownerRoot });
+
+    expect(result.warnings).toEqual([]);
+    expect(
+      await sameRealPath(
+        path.join(paths.sharedAgentsSkillsLink, 'legacy-ghost--legacy'),
+        legacySkill,
       ),
     ).toBe(true);
   });
