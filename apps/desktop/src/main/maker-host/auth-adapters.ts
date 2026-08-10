@@ -82,6 +82,7 @@ import {
   activeOwnerScopeKey,
   getActiveAppSession,
   isAppSessionBoundaryPending,
+  ownerScopedUserDataPath,
   type ActiveAppSession,
 } from '../appSessionState.js';
 import {
@@ -1063,7 +1064,9 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
     );
 
     const [skillsOutcome, rulesOutcome, pluginsOutcome] = await Promise.all([
-      prepareCodexGlobalSkillsLinks(this.codexHome).then(
+      prepareCodexGlobalSkillsLinks(this.codexHome, {
+        ownerRoot: ownerScopedUserDataPath(),
+      }).then(
         (r) => ({ ok: true as const, label: 'skills' as const, warnings: r.warnings }),
         (err: Error) => ({ ok: false as const, label: 'skills' as const, err }),
       ),

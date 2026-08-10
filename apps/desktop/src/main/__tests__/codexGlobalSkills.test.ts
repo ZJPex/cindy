@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   CODEX_LEGACY_CODEX_SKILLS_LINK_NAME,
   CODEX_SHARED_AGENTS_SKILLS_LINK_NAME,
+  codexDisabledSkillPathsForOwner,
   codexGlobalSkillsPaths,
   prepareCodexGlobalSkillsLinks,
 } from '../maker-host/codex-global-skills';
@@ -35,6 +36,11 @@ async function sameRealPath(a: string, b: string): Promise<boolean> {
   return normalize(ra) === normalize(rb);
 }
 
+async function linkDirectory(target: string, link: string): Promise<void> {
+  await fs.mkdir(path.dirname(link), { recursive: true });
+  await fs.symlink(target, link, process.platform === 'win32' ? 'junction' : 'dir');
+}
+
 afterEach(async () => {
   const dirs = tmpDirs;
   tmpDirs = [];
@@ -42,7 +48,116 @@ afterEach(async () => {
 });
 
 describe('prepareCodexGlobalSkillsLinks', () => {
-  it('links legacy Codex and shared agent skills directly under the custom CODEX_HOME skills root', async () => {
+  it('disables foreign Ghost paths reported through Codex native global discovery', async () => {
+    const root = await makeTmpDir();
+    const agentsSkills = path.join(root, 'home', '.agents', 'skills');
+    const ownerARoot = path.join(root, 'user-data-a', 'owners', 'owner-a');
+    const ownerBRoot = path.join(root, 'user-data-b', 'owners', 'owner-b');
+    const ownerASkill = path.join(ownerARoot, 'cindy-brain', 'ghost-a', 'skills', 'profile-a');
+    const ownerBSkill = path.join(ownerBRoot, 'cindy-brain', 'ghost-b', 'skills', 'profile-b');
+    const ownerALegacySkill = path.join(ownerARoot, 'brain', 'ghost-old', 'skills', 'legacy-a');
+    const ownerALink = path.join(agentsSkills, 'ghost-a--profile-a');
+    const ownerBLink = path.join(agentsSkills, 'ghost-b--profile-b');
+    const ownerALegacyLink = path.join(agentsSkills, 'ghost-old--legacy-a');
+    const globalSkill = path.join(agentsSkills, 'humanizer-zh');
+
+    await writeSkill(path.dirname(ownerASkill), path.basename(ownerASkill));
+    await writeSkill(path.dirname(ownerBSkill), path.basename(ownerBSkill));
+    await writeSkill(path.dirname(ownerALegacySkill), path.basename(ownerALegacySkill));
+    await writeSkill(agentsSkills, 'humanizer-zh');
+    await linkDirectory(ownerASkill, ownerALink);
+    await linkDirectory(ownerBSkill, ownerBLink);
+    await linkDirectory(ownerALegacySkill, ownerALegacyLink);
+
+    const reportedSkills = [
+      { path: path.join(ownerALink, 'SKILL.md') },
+      { path: path.join(ownerBLink, 'SKILL.md') },
+      { path: path.join(ownerALegacyLink, 'SKILL.md') },
+      { path: path.join(globalSkill, 'SKILL.md') },
+    ];
+    await expect(codexDisabledSkillPathsForOwner(reportedSkills, ownerBRoot)).resolves.toEqual([
+      path.join(ownerALink, 'SKILL.md'),
+      path.join(ownerALegacyLink, 'SKILL.md'),
+    ]);
+    await expect(codexDisabledSkillPathsForOwner(reportedSkills)).resolves.toEqual(
+      [ownerALink, ownerALegacyLink, ownerBLink]
+        .map((link) => path.join(link, 'SKILL.md'))
+        .sort(),
+    );
+  });
+
+  it('upgrades the legacy shared-root bridge to an owner-filtered projection', async () => {
+    const root = await makeTmpDir();
+    const homeDir = path.join(root, 'home');
+    const codexHome = path.join(root, 'xdt-codex-home');
+    const agentsSkills = path.join(homeDir, '.agents', 'skills');
+    const ownerARoot = path.join(root, 'user-data-a', 'owners', 'owner-a');
+    const ownerBRoot = path.join(root, 'user-data-b', 'owners', 'owner-b');
+    const ownerASkill = path.join(ownerARoot, 'cindy-brain', 'ghost-a', 'skills', 'profile-a');
+    const ownerBSkill = path.join(ownerBRoot, 'cindy-brain', 'ghost-b', 'skills', 'profile-b');
+    const ownerALink = path.join(agentsSkills, 'ghost-a--profile-a');
+    const ownerBLink = path.join(agentsSkills, 'ghost-b--profile-b');
+
+    await writeSkill(agentsSkills, 'user-global');
+    await writeSkill(path.dirname(ownerASkill), path.basename(ownerASkill));
+    await writeSkill(path.dirname(ownerBSkill), path.basename(ownerBSkill));
+    await linkDirectory(ownerASkill, ownerALink);
+    await linkDirectory(ownerBSkill, ownerBLink);
+
+    const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+    await linkDirectory(agentsSkills, paths.sharedAgentsSkillsLink);
+
+    const result = await prepareCodexGlobalSkillsLinks(codexHome, {
+      homeDir,
+      ownerRoot: ownerARoot,
+    });
+
+    expect(result.warnings).toEqual([]);
+    expect(await sameRealPath(paths.sharedAgentsSkillsLink, agentsSkills)).toBe(false);
+    expect(await sameRealPath(path.join(paths.sharedAgentsSkillsLink, 'user-global'), path.join(agentsSkills, 'user-global'))).toBe(true);
+    expect(await sameRealPath(path.join(paths.sharedAgentsSkillsLink, 'ghost-a--profile-a'), ownerASkill)).toBe(true);
+    await expect(fs.lstat(path.join(paths.sharedAgentsSkillsLink, 'ghost-b--profile-b'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await sameRealPath(ownerALink, ownerASkill)).toBe(true);
+    expect(await sameRealPath(ownerBLink, ownerBSkill)).toBe(true);
+  });
+
+  it('rebuilds the projection on owner switch without deleting either owner source', async () => {
+    const root = await makeTmpDir();
+    const homeDir = path.join(root, 'home');
+    const codexHome = path.join(root, 'xdt-codex-home');
+    const agentsSkills = path.join(homeDir, '.agents', 'skills');
+    const ownerARoot = path.join(root, 'user-data', 'owners', 'owner-a');
+    const ownerBRoot = path.join(root, 'user-data', 'owners', 'owner-b');
+    const ownerASkill = path.join(ownerARoot, 'cindy-brain', 'ghost-a', 'skills', 'profile-a');
+    const ownerBSkill = path.join(ownerBRoot, 'cindy-brain', 'ghost-b', 'skills', 'profile-b');
+    const ownerALink = path.join(agentsSkills, 'ghost-a--profile-a');
+    const ownerBLink = path.join(agentsSkills, 'ghost-b--profile-b');
+
+    await writeSkill(agentsSkills, 'user-global');
+    await writeSkill(path.dirname(ownerASkill), path.basename(ownerASkill));
+    await writeSkill(path.dirname(ownerBSkill), path.basename(ownerBSkill));
+    await linkDirectory(ownerASkill, ownerALink);
+    await linkDirectory(ownerBSkill, ownerBLink);
+
+    const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+    await prepareCodexGlobalSkillsLinks(codexHome, { homeDir, ownerRoot: ownerARoot });
+    const projectionA = await fs.realpath(paths.sharedAgentsSkillsLink);
+    expect(await sameRealPath(path.join(projectionA, 'ghost-a--profile-a'), ownerASkill)).toBe(true);
+
+    await prepareCodexGlobalSkillsLinks(codexHome, { homeDir, ownerRoot: ownerBRoot });
+    const projectionB = await fs.realpath(paths.sharedAgentsSkillsLink);
+    expect(projectionB).not.toBe(projectionA);
+    await expect(fs.lstat(path.join(projectionB, 'ghost-a--profile-a'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await sameRealPath(path.join(projectionB, 'ghost-b--profile-b'), ownerBSkill)).toBe(true);
+    await expect(fs.lstat(projectionA)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await sameRealPath(ownerALink, ownerASkill)).toBe(true);
+    expect(await sameRealPath(ownerBLink, ownerBSkill)).toBe(true);
+
+    const repeated = await prepareCodexGlobalSkillsLinks(codexHome, { homeDir, ownerRoot: ownerBRoot });
+    expect(repeated.changed).toBe(false);
+  });
+
+  it('links legacy Codex skills and projects shared agent skills under custom CODEX_HOME', async () => {
     const root = await makeTmpDir();
     const homeDir = path.join(root, 'home');
     const codexHome = path.join(root, 'xdt-codex-home');
@@ -59,7 +174,8 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     expect(path.basename(paths.legacyCodexSkillsLink)).toBe(CODEX_LEGACY_CODEX_SKILLS_LINK_NAME);
     expect(path.basename(paths.sharedAgentsSkillsLink)).toBe(CODEX_SHARED_AGENTS_SKILLS_LINK_NAME);
     expect(await sameRealPath(paths.legacyCodexSkillsLink, legacySkills)).toBe(true);
-    expect(await sameRealPath(paths.sharedAgentsSkillsLink, agentsSkills)).toBe(true);
+    expect(await sameRealPath(paths.sharedAgentsSkillsLink, agentsSkills)).toBe(false);
+    expect(await sameRealPath(path.join(paths.sharedAgentsSkillsLink, 'shared-skill'), path.join(agentsSkills, 'shared-skill'))).toBe(true);
   });
 
   it('skips missing source roots without failing the scan-entry setup', async () => {

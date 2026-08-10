@@ -51,7 +51,7 @@ import { tapWindowBroadcast } from '../device-link/broadcast-tap.js';
 import { remoteInvoke } from '../device-link/index.js';
 import { WorktreePool } from '../worktree/index.js';
 import { getReadyBinaryPath, getCachedBinaryStatus } from '../agent-binaries/index.js';
-import { activeOwnerScopeKey, isAppSessionBoundaryPending } from '../appSessionState.js';
+import { activeOwnerScopeKey, isAppSessionBoundaryPending, ownerScopedUserDataPath } from '../appSessionState.js';
 import {
   desktopClaudeAuthAdapter,
   desktopCodexAuthAdapter,
@@ -213,6 +213,7 @@ import {
   prepareCodexBrowserCompanion,
   resolveCodexBrowserCompanionSpawnConfig,
 } from './codex-browser-companion.js';
+import { codexDisabledSkillPathsForOwner } from './codex-global-skills.js';
 export { withRehydrateCloseSuppressed };
 
 type RemoteCcQuery = Awaited<
@@ -1061,6 +1062,8 @@ export function getMaker(): Maker {
           remoteHostId,
         });
       },
+      resolveCodexDisabledSkillPaths: ({ skills }) =>
+        codexDisabledSkillPathsForOwner(skills, ownerScopedUserDataPath()),
       makerMemory: makerMemoryManager,
       // 通讯录 prompt 段有效状态(codex 版): 在 claude 的判定链之上再与「实际应用
       // 到 running app-server 的 spawn 快照」对齐 —— 开关切换后失效失败(busy,

@@ -834,6 +834,38 @@ function isPaletteVisibleCodexSkill(skill: SkillMetadata): boolean {
   return !/\/plugins\/cache\/[^/]+\/[^/]+\/[^/]+\/skills\//i.test(normalizedPath);
 }
 
+function mergeHostDisabledSkillConfig(
+  config: Record<string, unknown>,
+  skills: ReadonlyArray<{ path: string; enabled: boolean }>,
+  hostDisabledPaths: readonly string[],
+): Record<string, unknown> {
+  const disabledPaths = new Set<string>();
+  const configured = config['skills.config'];
+  if (Array.isArray(configured)) {
+    for (const entry of configured) {
+      if (
+        entry &&
+        typeof entry === 'object' &&
+        typeof (entry as { path?: unknown }).path === 'string' &&
+        (entry as { enabled?: unknown }).enabled === false
+      ) {
+        disabledPaths.add((entry as { path: string }).path);
+      }
+    }
+  }
+  for (const skill of skills) {
+    if (!skill.enabled) disabledPaths.add(skill.path);
+  }
+  for (const skillPath of hostDisabledPaths) disabledPaths.add(skillPath);
+  if (disabledPaths.size === 0) return config;
+  return {
+    ...config,
+    'skills.config': [...disabledPaths]
+      .sort()
+      .map((skillPath) => ({ path: skillPath, enabled: false })),
+  };
+}
+
 function parseLeadingSlashToken(text: string): { name: string; rest: string } | null {
   const match = text.match(/^\/([^\s/]+)(?:\s+([\s\S]*))?$/);
   if (!match?.[1]) return null;
@@ -1651,8 +1683,12 @@ export class CodexAgent extends BaseAgent {
     const workingDir = opts.workingDir || os.homedir();
     try {
       const { skills, errors } = await this.listSkillsForCwd(workingDir, opts.forceReload ?? false);
+      const hostDisabledPaths = new Set(
+        await this.deps.resolveCodexDisabledSkillPaths?.({ workingDir, skills }) ?? [],
+      );
       const out: ListAgentSkillsResult = {
         skills: skills
+          .filter((skill) => !hostDisabledPaths.has(skill.path))
           .filter(isPaletteVisibleCodexSkill)
           .map((skill) => ({
             kind: 'agent-skill' as const,
@@ -3571,7 +3607,13 @@ export class CodexAgent extends BaseAgent {
         isolatedPluginOverlays: !opts.remoteHostId,
       },
     );
-    if (requiresCodexCapabilitySkillDiscovery(capabilityRoutingPolicy)) {
+    const resolveHostDisabledSkillPaths = opts.remoteHostId
+      ? undefined
+      : this.deps.resolveCodexDisabledSkillPaths;
+    if (
+      requiresCodexCapabilitySkillDiscovery(capabilityRoutingPolicy) ||
+      resolveHostDisabledSkillPaths
+    ) {
       try {
         assertCurrentHost('capability Skill discovery');
         const { skills, errors } = await this.listSkillsForHost(
@@ -3581,18 +3623,31 @@ export class CodexAgent extends BaseAgent {
           CRITICAL_THREAD_RPC_TIMEOUT_MS,
         );
         assertCurrentHost('capability Skill discovery');
-        capabilityRoutingConfig = {
-          ...capabilityRoutingConfig,
-          ...buildCodexCapabilitySkillConfigOverrides(capabilityRoutingPolicy, [
-            ...skills,
-            // A malformed restricted Skill may be absent from `skills` while
-            // its concrete SKILL.md path is still reported here. Disable that
-            // path too instead of failing open on a catalog parse error.
-            ...errors.flatMap((error) =>
-              error.path ? [{ path: error.path, enabled: true }] : [],
-            ),
-          ]),
-        };
+        if (requiresCodexCapabilitySkillDiscovery(capabilityRoutingPolicy)) {
+          capabilityRoutingConfig = {
+            ...capabilityRoutingConfig,
+            ...buildCodexCapabilitySkillConfigOverrides(capabilityRoutingPolicy, [
+              ...skills,
+              // A malformed restricted Skill may be absent from `skills` while
+              // its concrete SKILL.md path is still reported here. Disable that
+              // path too instead of failing open on a catalog parse error.
+              ...errors.flatMap((error) =>
+                error.path ? [{ path: error.path, enabled: true }] : [],
+              ),
+            ]),
+          };
+        }
+        if (resolveHostDisabledSkillPaths) {
+          const hostDisabledPaths = await resolveHostDisabledSkillPaths({
+            workingDir: opts.workingDir,
+            skills,
+          });
+          capabilityRoutingConfig = mergeHostDisabledSkillConfig(
+            capabilityRoutingConfig,
+            skills,
+            hostDisabledPaths,
+          );
+        }
       } catch (error) {
         releaseHostBindingLeaseIfNeeded();
         throw new Error(
