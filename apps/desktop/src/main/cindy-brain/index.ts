@@ -536,7 +536,10 @@ function getLegacyGhostRecoveryStatusForActiveSession(): LegacyGhostRecoveryStat
     currentLegacyGhostMigrationSession(),
     undefined,
     isAppSessionBoundaryPending(),
-    { reservedCommands: reservedBuiltinCommands },
+    {
+      reservedCommands: reservedBuiltinCommands,
+      rejectReservedIds: app.isPackaged,
+    },
   );
 }
 

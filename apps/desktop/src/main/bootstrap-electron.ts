@@ -549,6 +549,7 @@ import {
   type BuiltinApiKeyBridgeDeps,
 } from './secrets/builtinApiKeyBridge.js';
 import {
+  isCustomProviderRuntimeKeyStorageKey,
   isRendererAccessibleSafeStorageKey,
   type ProviderSecretId,
 } from '../shared/providerSecrets.js';
@@ -3899,12 +3900,18 @@ const registerIpcHandlers = () => {
   ipcMain.handle(
     'safe-storage-read',
     async (event: Electron.IpcMainInvokeEvent, key: string): Promise<string | null> => {
+      const strictCustomProviderRead = isCustomProviderRuntimeKeyStorageKey(key);
       try {
         assertTrustedAppRendererEvent(event);
         if (!isValidRendererKey(key)) return null;
         const filepath = resolveSafeStorageFilepath(key);
         if (!filepath) return null;
-        if (!safeStorage.isEncryptionAvailable()) return null;
+        if (!safeStorage.isEncryptionAvailable()) {
+          if (strictCustomProviderRead) {
+            throwIpcError('INTERNAL', 'custom provider credential is unavailable');
+          }
+          return null;
+        }
         if (!fs.existsSync(filepath)) return null;
         const content = fs.readFileSync(filepath, 'utf-8');
         const buffer = Buffer.from(content, 'base64');
@@ -3919,6 +3926,9 @@ const registerIpcHandlers = () => {
           safeStorageReadLog.error('read failed', {
             error: isIpcError(err) ? err.code : err instanceof Error ? err.name : 'unknown',
           });
+          if (strictCustomProviderRead) {
+            throwIpcError('INTERNAL', 'custom provider credential is unreadable');
+          }
         }
         return null;
       }
