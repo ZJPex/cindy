@@ -5930,15 +5930,19 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         if (kind === 'codex' && linksChanged) {
           skillParams.forceReload = true;
         }
+        let needsGlobalSkillsReload = false;
         if (kind === 'codex') {
-          const prep = await desktopCodexAuthAdapter.ensureGlobalCodexAssets();
-          if (prep.skillsChanged) skillParams.forceReload = true;
+          await desktopCodexAuthAdapter.ensureGlobalCodexAssets();
+          needsGlobalSkillsReload = desktopCodexAuthAdapter.skillsListCacheNeedsReload(
+            skillParams.workingDir,
+          );
+          if (needsGlobalSkillsReload) skillParams.forceReload = true;
         } else if (kind === 'claude-code') {
           await desktopClaudeAuthAdapter.ensureSharedGlobalSkills();
         }
         const result = await maker.listAgentSkills(kind, skillParams);
-        if (kind === 'codex' && skillParams.forceReload) {
-          desktopCodexAuthAdapter.markCodexSkillsListCacheReloaded();
+        if (kind === 'codex' && needsGlobalSkillsReload) {
+          desktopCodexAuthAdapter.markCodexSkillsListCacheReloaded(skillParams.workingDir);
         }
         return { success: true, ...result };
       } catch (err) {

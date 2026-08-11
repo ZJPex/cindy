@@ -1663,10 +1663,13 @@ export function getMaker(): Maker {
           // 本地 Codex 会话启动前的统一准备层：所有 maker.createSession 入口
           // (IPC / scheduler / IM / Orca 等)都会经过 lifecycleHooks.onBeforeStart,
           // 不能只依赖 maker-ipc 的 bootstrapSession。
-          let globalSkillsChanged = false;
+          let needsGlobalSkillsReload = false;
           if (agentKind === 'codex' && !remoteHostId) {
-            const prep = await desktopCodexAuthAdapter.ensureGlobalCodexAssets();
-            globalSkillsChanged = prep.skillsChanged;
+            await desktopCodexAuthAdapter.ensureGlobalCodexAssets();
+            // skills/list 按 cwd 缓存：只问「当前 cwd 是否仍落后于投影代次」，
+            // 不能在 A 刷新后清掉 B 的 dirty。
+            needsGlobalSkillsReload =
+              desktopCodexAuthAdapter.skillsListCacheNeedsReload(workingDir);
             // 延迟记忆重启 pending 时,本地 Codex 新会话加入 shared host 前先尝试
             // 兑现(其它会话全空闲才会真的重启;仍 busy 则放行,残余窗口见
             // deferredCodexRestart.ts 模块注释)。
@@ -1675,9 +1678,9 @@ export function getMaker(): Maker {
           // SSH remote 的 workingDir 属于远端文件系统，本机不能为它创建兼容链接。
           if (remoteHostId || !workingDir) {
             // 无项目 cwd 时 listAgentSkills 会回落 HOME；投影刚重建仍需 forceReload。
-            if (agentKind === 'codex' && !remoteHostId && globalSkillsChanged) {
+            if (agentKind === 'codex' && !remoteHostId && needsGlobalSkillsReload) {
               await codexAgent.listAgentSkills({ forceReload: true });
-              desktopCodexAuthAdapter.markCodexSkillsListCacheReloaded();
+              desktopCodexAuthAdapter.markCodexSkillsListCacheReloaded(workingDir);
             }
             return;
           }
@@ -1690,10 +1693,10 @@ export function getMaker(): Maker {
           }
           // Codex app-server 会按 cwd 缓存 skills/list；本轮新建链接或全局投影
           // 重建后必须在 startSession 前失效缓存，确保首个 session 就能用到新 Skill。
-          if (agentKind === 'codex' && (result.changed || globalSkillsChanged)) {
+          if (agentKind === 'codex' && (result.changed || needsGlobalSkillsReload)) {
             await codexAgent.listAgentSkills({ workingDir, forceReload: true });
-            if (globalSkillsChanged) {
-              desktopCodexAuthAdapter.markCodexSkillsListCacheReloaded();
+            if (needsGlobalSkillsReload) {
+              desktopCodexAuthAdapter.markCodexSkillsListCacheReloaded(workingDir);
             }
           }
         },

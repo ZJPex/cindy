@@ -756,15 +756,17 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
    */
   private pendingAssetsPrep: {
     ownerScopeKey: string;
-    promise: Promise<{ skillsChanged: boolean }>;
+    promise: Promise<{ skillsProjectionEpoch: number }>;
   } | null = null;
 
   /**
-   * owner 投影重建后、app-server `skills/list` 缓存尚未 forceReload 前保持 sticky。
+   * owner 投影重建代次。app-server 的 `skills/list` 按 cwd 缓存，因此不能用单个全局
+   * boolean：cwd A forceReload 后若清掉全局 dirty，cwd B 会继续命中旧缓存。
    * Ghost 变更可能先异步重建投影，随后会话启动时 prepare 已是 changed:false；
-   * 若不清 dirty，新会话仍会读到旧清单。
+   * 代次 sticky 保证每个 cwd 在首次使用新投影时仍会 forceReload。
    */
-  private skillsListCacheNeedsReload = false;
+  private skillsProjectionEpoch = 0;
+  private skillsListReloadedEpochByCwd = new Map<string, number>();
 
   /**
    * 进行中的 reconcileWithSystemCodex 调用 —— 多个调用点 (构造 / getState / getAuthEnv /
@@ -1056,7 +1058,7 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
     }
   }
 
-  async ensureGlobalCodexAssets(): Promise<{ skillsChanged: boolean }> {
+  async ensureGlobalCodexAssets(): Promise<{ skillsProjectionEpoch: number }> {
     const ownerScopeKey = activeOwnerScopeKey();
     const ownerRoot = ownerScopedUserDataPath();
     const current = this.pendingAssetsPrep;
@@ -1067,7 +1069,7 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
       : this.runEnsureGlobalCodexAssets(ownerRoot);
     const pending: {
       ownerScopeKey: string;
-      promise: Promise<{ skillsChanged: boolean }>;
+      promise: Promise<{ skillsProjectionEpoch: number }>;
     } = { ownerScopeKey, promise: start };
     pending.promise = start.finally(() => {
       if (this.pendingAssetsPrep === pending) this.pendingAssetsPrep = null;
@@ -1076,12 +1078,30 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
     return pending.promise;
   }
 
-  /** 投影重建后的 skills/list forceReload 成功时清掉 sticky dirty。 */
-  markCodexSkillsListCacheReloaded(): void {
-    this.skillsListCacheNeedsReload = false;
+  /**
+   * 与 CodexAgent.listAgentSkills 一致：无项目 cwd 时 app-server 回落 HOME。
+   * 用作 skills/list 缓存脏状态的跟踪键。
+   */
+  codexSkillsListCacheKey(workingDir?: string | null): string {
+    const trimmed = typeof workingDir === 'string' ? workingDir.trim() : '';
+    return trimmed || os.homedir();
   }
 
-  private async runEnsureGlobalCodexAssets(ownerRoot: string): Promise<{ skillsChanged: boolean }> {
+  /** 该 cwd（或 HOME 回落）是否仍需对 app-server skills/list 做 forceReload。 */
+  skillsListCacheNeedsReload(workingDir?: string | null): boolean {
+    const cacheKey = this.codexSkillsListCacheKey(workingDir);
+    return (this.skillsListReloadedEpochByCwd.get(cacheKey) ?? 0) < this.skillsProjectionEpoch;
+  }
+
+  /** 投影重建后、指定 cwd 的 skills/list forceReload 成功时推进该 cwd 的已刷新代次。 */
+  markCodexSkillsListCacheReloaded(workingDir?: string | null): void {
+    const cacheKey = this.codexSkillsListCacheKey(workingDir);
+    this.skillsListReloadedEpochByCwd.set(cacheKey, this.skillsProjectionEpoch);
+  }
+
+  private async runEnsureGlobalCodexAssets(
+    ownerRoot: string,
+  ): Promise<{ skillsProjectionEpoch: number }> {
     // Load-bearing order: Codex skill linking scans ~/.agents/skills, so shared
     // links must populate that directory before prepareCodexGlobalSkillsLinks runs.
     const sharedOutcome = await prepareSharedGlobalSkillLinks().then(
@@ -1148,9 +1168,9 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
       );
     }
     if (skillsOutcome.ok && skillsOutcome.changed) {
-      this.skillsListCacheNeedsReload = true;
+      this.skillsProjectionEpoch += 1;
     }
-    return { skillsChanged: this.skillsListCacheNeedsReload };
+    return { skillsProjectionEpoch: this.skillsProjectionEpoch };
   }
 
   /** maker-host 在构造完 codexAgent 后调一次, 注入 dispose 回调。 */

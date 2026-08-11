@@ -4,6 +4,7 @@ const harness = vi.hoisted(() => ({
   ownerScopeKey: 'cloud:owner-a:1',
   ownerRoot: '/data/owners/owner-a',
   userDataDir: '/tmp/cindy-codex-assets-owner-scope',
+  homeDir: '/home/test-user',
 }));
 
 vi.mock('electron', () => ({
@@ -16,6 +17,18 @@ vi.mock('electron', () => ({
 }));
 
 vi.mock('@cindy/maker-core', () => ({}));
+
+vi.mock('node:os', async () => {
+  const actual = await vi.importActual<typeof import('node:os')>('node:os');
+  return {
+    ...actual,
+    default: {
+      ...actual,
+      homedir: () => harness.homeDir,
+    },
+    homedir: () => harness.homeDir,
+  };
+});
 
 vi.mock('../../appSessionState.js', () => ({
   activeOwnerScopeKey: () => harness.ownerScopeKey,
@@ -42,18 +55,23 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
         finishOwnerB = resolve;
       });
       const runEnsureGlobalCodexAssets = vi
-        .fn<(ownerRoot: string) => Promise<{ skillsChanged: boolean }>>()
+        .fn<(ownerRoot: string) => Promise<{ skillsProjectionEpoch: number }>>()
         .mockImplementationOnce(async () => {
           await ownerARun;
-          return { skillsChanged: false };
+          return { skillsProjectionEpoch: 0 };
         })
         .mockImplementationOnce(async () => {
           await ownerBRun;
-          return { skillsChanged: false };
+          return { skillsProjectionEpoch: 0 };
         });
       Object.defineProperties(adapter, {
         pendingAssetsPrep: { configurable: true, writable: true, value: null },
-        skillsListCacheNeedsReload: { configurable: true, writable: true, value: false },
+        skillsProjectionEpoch: { configurable: true, writable: true, value: 0 },
+        skillsListReloadedEpochByCwd: {
+          configurable: true,
+          writable: true,
+          value: new Map<string, number>(),
+        },
         runEnsureGlobalCodexAssets: {
           configurable: true,
           value: runEnsureGlobalCodexAssets,
@@ -76,47 +94,74 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
       expect(runEnsureGlobalCodexAssets).toHaveBeenLastCalledWith('/data/owners/owner-b');
 
       finishOwnerB();
-      await expect(ownerB).resolves.toEqual({ skillsChanged: false });
+      await expect(ownerB).resolves.toEqual({ skillsProjectionEpoch: 0 });
     },
   );
 
-  it('keeps skillsChanged sticky until the skills/list cache is marked reloaded', async () => {
+  it('keeps per-cwd skills/list dirty sticky across projection epochs', async () => {
     const { DesktopCodexAuthAdapter } = await import('../auth-adapters.js');
     const adapter = Object.create(DesktopCodexAuthAdapter.prototype) as {
-      skillsListCacheNeedsReload: boolean;
+      skillsProjectionEpoch: number;
+      skillsListReloadedEpochByCwd: Map<string, number>;
       pendingAssetsPrep: unknown;
-      ensureGlobalCodexAssets: () => Promise<{ skillsChanged: boolean }>;
-      markCodexSkillsListCacheReloaded: () => void;
-      runEnsureGlobalCodexAssets: (ownerRoot: string) => Promise<{ skillsChanged: boolean }>;
+      ensureGlobalCodexAssets: () => Promise<{ skillsProjectionEpoch: number }>;
+      skillsListCacheNeedsReload: (workingDir?: string | null) => boolean;
+      markCodexSkillsListCacheReloaded: (workingDir?: string | null) => void;
+      codexSkillsListCacheKey: (workingDir?: string | null) => string;
+      runEnsureGlobalCodexAssets: (ownerRoot: string) => Promise<{ skillsProjectionEpoch: number }>;
     };
     Object.defineProperties(adapter, {
       pendingAssetsPrep: { configurable: true, writable: true, value: null },
-      skillsListCacheNeedsReload: { configurable: true, writable: true, value: false },
+      skillsProjectionEpoch: { configurable: true, writable: true, value: 0 },
+      skillsListReloadedEpochByCwd: {
+        configurable: true,
+        writable: true,
+        value: new Map<string, number>(),
+      },
       ensureGlobalCodexAssets: {
         configurable: true,
         value: DesktopCodexAuthAdapter.prototype.ensureGlobalCodexAssets,
+      },
+      skillsListCacheNeedsReload: {
+        configurable: true,
+        value: DesktopCodexAuthAdapter.prototype.skillsListCacheNeedsReload,
       },
       markCodexSkillsListCacheReloaded: {
         configurable: true,
         value: DesktopCodexAuthAdapter.prototype.markCodexSkillsListCacheReloaded,
       },
+      codexSkillsListCacheKey: {
+        configurable: true,
+        value: DesktopCodexAuthAdapter.prototype.codexSkillsListCacheKey,
+      },
       runEnsureGlobalCodexAssets: {
         configurable: true,
         value: async () => {
-          adapter.skillsListCacheNeedsReload = true;
-          return { skillsChanged: adapter.skillsListCacheNeedsReload };
+          adapter.skillsProjectionEpoch += 1;
+          return { skillsProjectionEpoch: adapter.skillsProjectionEpoch };
         },
       },
     });
 
-    await expect(adapter.ensureGlobalCodexAssets()).resolves.toEqual({ skillsChanged: true });
+    await expect(adapter.ensureGlobalCodexAssets()).resolves.toEqual({ skillsProjectionEpoch: 1 });
+    expect(adapter.skillsListCacheNeedsReload('/repo-a')).toBe(true);
+    expect(adapter.skillsListCacheNeedsReload('/repo-b')).toBe(true);
+
+    adapter.markCodexSkillsListCacheReloaded('/repo-a');
+    expect(adapter.skillsListCacheNeedsReload('/repo-a')).toBe(false);
+    expect(adapter.skillsListCacheNeedsReload('/repo-b')).toBe(true);
+
     Object.defineProperty(adapter, 'runEnsureGlobalCodexAssets', {
       configurable: true,
-      value: async () => ({ skillsChanged: adapter.skillsListCacheNeedsReload }),
+      value: async () => ({ skillsProjectionEpoch: adapter.skillsProjectionEpoch }),
     });
-    await expect(adapter.ensureGlobalCodexAssets()).resolves.toEqual({ skillsChanged: true });
+    await expect(adapter.ensureGlobalCodexAssets()).resolves.toEqual({ skillsProjectionEpoch: 1 });
+    expect(adapter.skillsListCacheNeedsReload('/repo-a')).toBe(false);
+    expect(adapter.skillsListCacheNeedsReload('/repo-b')).toBe(true);
 
-    adapter.markCodexSkillsListCacheReloaded();
-    await expect(adapter.ensureGlobalCodexAssets()).resolves.toEqual({ skillsChanged: false });
+    adapter.markCodexSkillsListCacheReloaded('/repo-b');
+    expect(adapter.skillsListCacheNeedsReload('/repo-b')).toBe(false);
+    expect(adapter.skillsListCacheNeedsReload(undefined)).toBe(true);
+    expect(adapter.codexSkillsListCacheKey(undefined)).toBe(harness.homeDir);
   });
 });
