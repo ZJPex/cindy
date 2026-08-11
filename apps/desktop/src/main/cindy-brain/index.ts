@@ -208,6 +208,7 @@ import { GhostPreviewSlot } from './previewSlot.js';
 import { GhostScheduleSlot, isMainShellWindowUrl } from './scheduleSlot.js';
 import { GhostWorkspaceSlot, type WorkspaceSessionService } from './workspaceSlot.js';
 import { GhostIOSSimulatorSlot, type IOSSimulatorSlotFocusContext } from './iosSimulatorSlot.js';
+import { resolveIOSSimulatorPluginAccess } from './iosSimulatorPluginGate.js';
 import {
   clearIOSSimulatorRendererAccess,
   focusIOSSimulatorRendererSession,
@@ -712,6 +713,16 @@ export function waitForGhostMutations(): Promise<void> {
 /** Account-managed built-ins are unavailable outside a verified cloud session. */
 export function isGhostAvailableForActiveSession(id: string): boolean {
   return !isCindyAccountGhostId(id) || getAppCapabilities().canUseCindyAccountServices;
+}
+
+/** Live Host capability gate shared by Agent transports and Renderer IPC. */
+export function getIOSSimulatorPluginAccessDecision(
+  workingDir: string | null = null,
+) {
+  return resolveIOSSimulatorPluginAccess(getGhostManager().list(), workingDir, {
+    isAvailableForActiveSession: isGhostAvailableForActiveSession,
+    isDisabledForWorkdir: isGhostDisabledForWorkdir,
+  });
 }
 
 function availableGhosts(): InstalledGhost[] {
