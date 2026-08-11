@@ -6366,6 +6366,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     }
 
     await hydrateProviderIdBeforeSessionStart(o);
+    if (o.agentKind === 'codex' && !o.remoteHostId) {
+      await desktopCodexAuthAdapter.ensureGlobalCodexAssets();
+    }
     // 停用轴准入(PR #744 review):**新建**会话不得路由到用户停用的模型 / 来源。
     // renderer 选择器已过滤,但 create-session 在 device-link allowlist 内,老控制端
     // 可直接点名 —— main 必须自己裁决。resume 豁免(运行中的会话不打断)只给

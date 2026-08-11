@@ -348,6 +348,63 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     expect(repeated.changed).toBe(false);
   });
 
+  it('rebuilds the projection when the owner gains a newly installed Ghost Skill', async () => {
+    const root = await makeTmpDir();
+    const homeDir = path.join(root, 'home');
+    const codexHome = path.join(root, 'xdt-codex-home');
+    const agentsSkills = path.join(homeDir, '.agents', 'skills');
+    const ownerRoot = path.join(root, 'user-data', 'owners', 'owner-b');
+    const firstItem = { dir: 'agent-skills/first', name: 'first' };
+    const secondItem = { dir: 'agent-skills/second', name: 'second' };
+    const ghostDir = path.join(ownerRoot, 'cindy-brain', 'same-ghost');
+    const firstSkill = await writeInstalledGhostSkill(ownerRoot, 'same-ghost', firstItem);
+    await writeSkill(agentsSkills, 'user-global');
+
+    const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+    const initial = await prepareCodexGlobalSkillsLinks(codexHome, { homeDir, ownerRoot });
+    expect(initial.warnings).toEqual([]);
+    expect(
+      await sameRealPath(
+        path.join(paths.sharedAgentsSkillsLink, 'same-ghost--first'),
+        firstSkill,
+      ),
+    ).toBe(true);
+    await expect(
+      fs.lstat(path.join(paths.sharedAgentsSkillsLink, 'same-ghost--second')),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+
+    const secondSkill = path.join(ghostDir, ...secondItem.dir.split('/'));
+    await writeSkill(path.dirname(secondSkill), path.basename(secondSkill));
+    await fs.writeFile(
+      path.join(ghostDir, 'ghost.json'),
+      JSON.stringify({
+        schemaVersion: 2,
+        id: 'same-ghost',
+        name: 'same-ghost',
+        version: '1.0.0',
+        kind: 'chip',
+        entry: 'main.js',
+        slots: ['skill'],
+        skill: {
+          items: [
+            { ...firstItem, description: 'test skill' },
+            { ...secondItem, description: 'test skill' },
+          ],
+        },
+      }),
+      'utf8',
+    );
+
+    const refreshed = await prepareCodexGlobalSkillsLinks(codexHome, { homeDir, ownerRoot });
+    expect(refreshed.warnings).toEqual([]);
+    expect(
+      await sameRealPath(
+        path.join(paths.sharedAgentsSkillsLink, 'same-ghost--second'),
+        secondSkill,
+      ),
+    ).toBe(true);
+  });
+
   it('projects the current owner copy when another Profile occupies the shared link name', async () => {
     const root = await makeTmpDir();
     const homeDir = path.join(root, 'home');

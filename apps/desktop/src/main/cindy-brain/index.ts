@@ -134,6 +134,7 @@ import { mapGhostOauthConnectError } from './ghostOauthSetupError.js';
 import { reclaimLoopbackPort } from './portReclaim.js';
 import { GhostConnectionManager } from './ghostConnections.js';
 import { getResolvedMainLocale, t } from '../i18n.js';
+import { scheduleCodexGlobalSkillsRefresh } from '../maker-host/codex-global-skills-refresh.js';
 import { reconcileGhostSkillLinks } from './skillSlot.js';
 import {
   assertTrustedAppRendererEvent,
@@ -5869,6 +5870,7 @@ function scheduleGhostSkillReconcile(): void {
             log.info('ghost skill links reconciled', {
               actions: result.actions.filter((a) => a.op !== 'kept'),
             });
+            scheduleCodexGlobalSkillsRefresh();
           }
         } catch (err) {
           log.warn('ghost skill reconcile failed', {

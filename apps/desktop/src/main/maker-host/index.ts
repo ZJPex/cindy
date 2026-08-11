@@ -227,6 +227,10 @@ import {
   resolveCodexBrowserCompanionSpawnConfig,
 } from './codex-browser-companion.js';
 import { codexDisabledSkillPathsForOwner } from './codex-global-skills.js';
+import {
+  scheduleCodexGlobalSkillsRefresh,
+  setCodexGlobalSkillsRefreshHandler,
+} from './codex-global-skills-refresh.js';
 export { withRehydrateCloseSuppressed };
 
 type RemoteCcQuery = Awaited<
@@ -1535,6 +1539,7 @@ export function getMaker(): Maker {
     // auth-adapters 的测试在真实文件系统留痕(2026-07-03 曾把含真实凭证硬链的
     // codex-home 生成进仓库),现改为装配 maker 时显式预热,import 保持零副作用。
     desktopCodexAuthAdapter.warmUp();
+    setCodexGlobalSkillsRefreshHandler(() => desktopCodexAuthAdapter.ensureGlobalCodexAssets());
 
     // pi(实验性,个人分支):二进制在位才注册;缺失时 agents map 不含 pi,
     // 既有环境零影响。模型清单走目录 pi 投影(xd 网关模型经 active-catalog 按
