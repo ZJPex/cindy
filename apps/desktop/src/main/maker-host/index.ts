@@ -1586,7 +1586,9 @@ export function getMaker(): Maker {
     // auth-adapters 的测试在真实文件系统留痕(2026-07-03 曾把含真实凭证硬链的
     // codex-home 生成进仓库),现改为装配 maker 时显式预热,import 保持零副作用。
     desktopCodexAuthAdapter.warmUp();
-    setCodexGlobalSkillsRefreshHandler(() => desktopCodexAuthAdapter.ensureGlobalCodexAssets());
+    setCodexGlobalSkillsRefreshHandler(async () => {
+      await desktopCodexAuthAdapter.ensureGlobalCodexAssets();
+    });
 
     // pi(实验性,个人分支):二进制在位才注册;缺失时 agents map 不含 pi,
     // 既有环境零影响。模型清单走目录 pi 投影(xd 网关模型经 active-catalog 按
@@ -1661,15 +1663,24 @@ export function getMaker(): Maker {
           // 本地 Codex 会话启动前的统一准备层：所有 maker.createSession 入口
           // (IPC / scheduler / IM / Orca 等)都会经过 lifecycleHooks.onBeforeStart,
           // 不能只依赖 maker-ipc 的 bootstrapSession。
+          let globalSkillsChanged = false;
           if (agentKind === 'codex' && !remoteHostId) {
-            await desktopCodexAuthAdapter.ensureGlobalCodexAssets();
+            const prep = await desktopCodexAuthAdapter.ensureGlobalCodexAssets();
+            globalSkillsChanged = prep.skillsChanged;
             // 延迟记忆重启 pending 时,本地 Codex 新会话加入 shared host 前先尝试
             // 兑现(其它会话全空闲才会真的重启;仍 busy 则放行,残余窗口见
             // deferredCodexRestart.ts 模块注释)。
             await _beforeLocalCodexSessionStartHook?.();
           }
           // SSH remote 的 workingDir 属于远端文件系统，本机不能为它创建兼容链接。
-          if (remoteHostId || !workingDir) return;
+          if (remoteHostId || !workingDir) {
+            // 无项目 cwd 时 listAgentSkills 会回落 HOME；投影刚重建仍需 forceReload。
+            if (agentKind === 'codex' && !remoteHostId && globalSkillsChanged) {
+              await codexAgent.listAgentSkills({ forceReload: true });
+              desktopCodexAuthAdapter.markCodexSkillsListCacheReloaded();
+            }
+            return;
+          }
           const result = await prepareSharedProjectSkillLinks({ workingDir });
           for (const warning of result.warnings) {
             desktopMakerLogger.warn('shared project skill link warning', {
@@ -1677,10 +1688,13 @@ export function getMaker(): Maker {
               warning,
             });
           }
-          // Codex app-server 会按 cwd 缓存 skills/list；本轮新建链接后必须在
-          // startSession 前失效缓存，确保首个 session 就能使用刚共享的 Skill。
-          if (agentKind === 'codex' && result.changed) {
+          // Codex app-server 会按 cwd 缓存 skills/list；本轮新建链接或全局投影
+          // 重建后必须在 startSession 前失效缓存，确保首个 session 就能用到新 Skill。
+          if (agentKind === 'codex' && (result.changed || globalSkillsChanged)) {
             await codexAgent.listAgentSkills({ workingDir, forceReload: true });
+            if (globalSkillsChanged) {
+              desktopCodexAuthAdapter.markCodexSkillsListCacheReloaded();
+            }
           }
         },
         onStartSucceeded: (sessionId, opts) => {

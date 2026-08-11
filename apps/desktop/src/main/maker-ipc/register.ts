@@ -5931,11 +5931,15 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           skillParams.forceReload = true;
         }
         if (kind === 'codex') {
-          await desktopCodexAuthAdapter.ensureGlobalCodexAssets();
+          const prep = await desktopCodexAuthAdapter.ensureGlobalCodexAssets();
+          if (prep.skillsChanged) skillParams.forceReload = true;
         } else if (kind === 'claude-code') {
           await desktopClaudeAuthAdapter.ensureSharedGlobalSkills();
         }
         const result = await maker.listAgentSkills(kind, skillParams);
+        if (kind === 'codex' && skillParams.forceReload) {
+          desktopCodexAuthAdapter.markCodexSkillsListCacheReloaded();
+        }
         return { success: true, ...result };
       } catch (err) {
         return {

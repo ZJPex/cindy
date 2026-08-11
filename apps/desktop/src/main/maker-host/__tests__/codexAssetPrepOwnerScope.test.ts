@@ -42,11 +42,18 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
         finishOwnerB = resolve;
       });
       const runEnsureGlobalCodexAssets = vi
-        .fn<(ownerRoot: string) => Promise<void>>()
-        .mockReturnValueOnce(ownerARun)
-        .mockReturnValueOnce(ownerBRun);
+        .fn<(ownerRoot: string) => Promise<{ skillsChanged: boolean }>>()
+        .mockImplementationOnce(async () => {
+          await ownerARun;
+          return { skillsChanged: false };
+        })
+        .mockImplementationOnce(async () => {
+          await ownerBRun;
+          return { skillsChanged: false };
+        });
       Object.defineProperties(adapter, {
         pendingAssetsPrep: { configurable: true, writable: true, value: null },
+        skillsListCacheNeedsReload: { configurable: true, writable: true, value: false },
         runEnsureGlobalCodexAssets: {
           configurable: true,
           value: runEnsureGlobalCodexAssets,
@@ -69,7 +76,47 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
       expect(runEnsureGlobalCodexAssets).toHaveBeenLastCalledWith('/data/owners/owner-b');
 
       finishOwnerB();
-      await expect(ownerB).resolves.toBeUndefined();
+      await expect(ownerB).resolves.toEqual({ skillsChanged: false });
     },
   );
+
+  it('keeps skillsChanged sticky until the skills/list cache is marked reloaded', async () => {
+    const { DesktopCodexAuthAdapter } = await import('../auth-adapters.js');
+    const adapter = Object.create(DesktopCodexAuthAdapter.prototype) as {
+      skillsListCacheNeedsReload: boolean;
+      pendingAssetsPrep: unknown;
+      ensureGlobalCodexAssets: () => Promise<{ skillsChanged: boolean }>;
+      markCodexSkillsListCacheReloaded: () => void;
+      runEnsureGlobalCodexAssets: (ownerRoot: string) => Promise<{ skillsChanged: boolean }>;
+    };
+    Object.defineProperties(adapter, {
+      pendingAssetsPrep: { configurable: true, writable: true, value: null },
+      skillsListCacheNeedsReload: { configurable: true, writable: true, value: false },
+      ensureGlobalCodexAssets: {
+        configurable: true,
+        value: DesktopCodexAuthAdapter.prototype.ensureGlobalCodexAssets,
+      },
+      markCodexSkillsListCacheReloaded: {
+        configurable: true,
+        value: DesktopCodexAuthAdapter.prototype.markCodexSkillsListCacheReloaded,
+      },
+      runEnsureGlobalCodexAssets: {
+        configurable: true,
+        value: async () => {
+          adapter.skillsListCacheNeedsReload = true;
+          return { skillsChanged: adapter.skillsListCacheNeedsReload };
+        },
+      },
+    });
+
+    await expect(adapter.ensureGlobalCodexAssets()).resolves.toEqual({ skillsChanged: true });
+    Object.defineProperty(adapter, 'runEnsureGlobalCodexAssets', {
+      configurable: true,
+      value: async () => ({ skillsChanged: adapter.skillsListCacheNeedsReload }),
+    });
+    await expect(adapter.ensureGlobalCodexAssets()).resolves.toEqual({ skillsChanged: true });
+
+    adapter.markCodexSkillsListCacheReloaded();
+    await expect(adapter.ensureGlobalCodexAssets()).resolves.toEqual({ skillsChanged: false });
+  });
 });

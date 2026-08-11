@@ -754,7 +754,17 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
    * 串在旧准备之后，避免两个 Profile 并发改写同一个 CODEX_HOME 投影。结束后不长期缓存，
    * 因为源文件 (~/.codex/AGENTS.md) 随时可能被用户修改。
    */
-  private pendingAssetsPrep: { ownerScopeKey: string; promise: Promise<void> } | null = null;
+  private pendingAssetsPrep: {
+    ownerScopeKey: string;
+    promise: Promise<{ skillsChanged: boolean }>;
+  } | null = null;
+
+  /**
+   * owner 投影重建后、app-server `skills/list` 缓存尚未 forceReload 前保持 sticky。
+   * Ghost 变更可能先异步重建投影，随后会话启动时 prepare 已是 changed:false；
+   * 若不清 dirty，新会话仍会读到旧清单。
+   */
+  private skillsListCacheNeedsReload = false;
 
   /**
    * 进行中的 reconcileWithSystemCodex 调用 —— 多个调用点 (构造 / getState / getAuthEnv /
@@ -1046,7 +1056,7 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
     }
   }
 
-  async ensureGlobalCodexAssets(): Promise<void> {
+  async ensureGlobalCodexAssets(): Promise<{ skillsChanged: boolean }> {
     const ownerScopeKey = activeOwnerScopeKey();
     const ownerRoot = ownerScopedUserDataPath();
     const current = this.pendingAssetsPrep;
@@ -1055,7 +1065,10 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
     const start = current
       ? current.promise.catch(() => undefined).then(() => this.runEnsureGlobalCodexAssets(ownerRoot))
       : this.runEnsureGlobalCodexAssets(ownerRoot);
-    const pending = { ownerScopeKey, promise: start };
+    const pending: {
+      ownerScopeKey: string;
+      promise: Promise<{ skillsChanged: boolean }>;
+    } = { ownerScopeKey, promise: start };
     pending.promise = start.finally(() => {
       if (this.pendingAssetsPrep === pending) this.pendingAssetsPrep = null;
     });
@@ -1063,7 +1076,12 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
     return pending.promise;
   }
 
-  private async runEnsureGlobalCodexAssets(ownerRoot: string): Promise<void> {
+  /** 投影重建后的 skills/list forceReload 成功时清掉 sticky dirty。 */
+  markCodexSkillsListCacheReloaded(): void {
+    this.skillsListCacheNeedsReload = false;
+  }
+
+  private async runEnsureGlobalCodexAssets(ownerRoot: string): Promise<{ skillsChanged: boolean }> {
     // Load-bearing order: Codex skill linking scans ~/.agents/skills, so shared
     // links must populate that directory before prepareCodexGlobalSkillsLinks runs.
     const sharedOutcome = await prepareSharedGlobalSkillLinks().then(
@@ -1075,7 +1093,12 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
       prepareCodexGlobalSkillsLinks(this.codexHome, {
         ownerRoot,
       }).then(
-        (r) => ({ ok: true as const, label: 'skills' as const, warnings: r.warnings }),
+        (r) => ({
+          ok: true as const,
+          label: 'skills' as const,
+          warnings: r.warnings,
+          changed: r.changed,
+        }),
         (err: Error) => ({ ok: false as const, label: 'skills' as const, err }),
       ),
       prepareCodexGlobalRulesCopy(this.codexHome).then(
@@ -1124,6 +1147,10 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
         `Cannot start Codex safely because Cindy could not isolate a downstream plugin capability: ${pluginsOutcome.routingFailures.join('; ')}`,
       );
     }
+    if (skillsOutcome.ok && skillsOutcome.changed) {
+      this.skillsListCacheNeedsReload = true;
+    }
+    return { skillsChanged: this.skillsListCacheNeedsReload };
   }
 
   /** maker-host 在构造完 codexAgent 后调一次, 注入 dispose 回调。 */

@@ -99,6 +99,7 @@ describe('local codex session start preparation', () => {
     const order: string[] = [];
     const ensureGlobalCodexAssets = vi.fn(async () => {
       order.push('assets');
+      return { skillsChanged: false };
     });
     const beforeLocalCodexSessionStart = vi.fn(async () => {
       order.push('deferred-restart');
@@ -134,8 +135,59 @@ describe('local codex session start preparation', () => {
     expect(beforeLocalCodexSessionStart).toHaveBeenCalledTimes(1);
   });
 
+  it('force-reloads Codex skills/list after a rebuilt global projection', async () => {
+    const order: string[] = [];
+    const ensureGlobalCodexAssets = vi.fn(async () => {
+      order.push('assets');
+      return { skillsChanged: true };
+    });
+    const listAgentSkills = vi.fn(
+      async (_opts: { workingDir?: string; forceReload?: boolean }) => {
+        order.push('force-reload');
+        return { skills: [] };
+      },
+    );
+    const markCodexSkillsListCacheReloaded = vi.fn(() => {
+      order.push('mark-reloaded');
+    });
+    const startSession = vi.fn(async () => {
+      order.push('start');
+      return createHandle('thread-1');
+    });
+
+    const maker = new Maker({
+      agents: { codex: createCodexAgent(startSession) },
+      storage: createStorage(),
+      logger: createLogger(),
+      lifecycleHooks: {
+        onBeforeStart: async ({ agentKind, workingDir, remoteHostId }) => {
+          let globalSkillsChanged = false;
+          if (agentKind === 'codex' && !remoteHostId) {
+            const prep = await ensureGlobalCodexAssets();
+            globalSkillsChanged = prep.skillsChanged;
+          }
+          if (agentKind === 'codex' && !remoteHostId && globalSkillsChanged) {
+            await listAgentSkills({ workingDir, forceReload: true });
+            markCodexSkillsListCacheReloaded();
+          }
+        },
+      },
+    });
+
+    await maker.createSession({
+      id: 'session-reload',
+      agentKind: 'codex',
+      workingDir: '/repo',
+      model: 'gpt-5.4',
+    });
+
+    expect(order).toEqual(['assets', 'force-reload', 'mark-reloaded', 'start']);
+    expect(listAgentSkills).toHaveBeenCalledWith({ workingDir: '/repo', forceReload: true });
+    expect(markCodexSkillsListCacheReloaded).toHaveBeenCalledTimes(1);
+  });
+
   it('skips CODEX_HOME asset refresh for remote codex sessions', async () => {
-    const ensureGlobalCodexAssets = vi.fn(async () => undefined);
+    const ensureGlobalCodexAssets = vi.fn(async () => ({ skillsChanged: false }));
     const startSession = vi.fn(async () => createHandle('thread-remote'));
     const maker = new Maker({
       agents: { codex: createCodexAgent(startSession) },
