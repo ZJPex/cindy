@@ -1087,16 +1087,25 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
     return trimmed || os.homedir();
   }
 
-  /** 该 cwd（或 HOME 回落）是否仍需对 app-server skills/list 做 forceReload。 */
-  skillsListCacheNeedsReload(workingDir?: string | null): boolean {
+  /**
+   * 返回该 cwd（或 HOME 回落）下一次 forceReload 应覆盖的投影代次。
+   * 调用方必须在发起异步请求前捕获该值，避免请求期间的新投影被旧扫描误标为已刷新。
+   */
+  codexSkillsListReloadEpoch(workingDir?: string | null): number | null {
     const cacheKey = this.codexSkillsListCacheKey(workingDir);
-    return (this.skillsListReloadedEpochByCwd.get(cacheKey) ?? 0) < this.skillsProjectionEpoch;
+    return (this.skillsListReloadedEpochByCwd.get(cacheKey) ?? 0) < this.skillsProjectionEpoch
+      ? this.skillsProjectionEpoch
+      : null;
   }
 
-  /** 投影重建后、指定 cwd 的 skills/list forceReload 成功时推进该 cwd 的已刷新代次。 */
-  markCodexSkillsListCacheReloaded(workingDir?: string | null): void {
+  /** 指定 cwd 的 skills/list forceReload 成功时，只推进到请求开始前捕获的投影代次。 */
+  markCodexSkillsListCacheReloaded(
+    workingDir: string | null | undefined,
+    reloadedEpoch: number,
+  ): void {
     const cacheKey = this.codexSkillsListCacheKey(workingDir);
-    this.skillsListReloadedEpochByCwd.set(cacheKey, this.skillsProjectionEpoch);
+    const previousEpoch = this.skillsListReloadedEpochByCwd.get(cacheKey) ?? 0;
+    this.skillsListReloadedEpochByCwd.set(cacheKey, Math.max(previousEpoch, reloadedEpoch));
   }
 
   private async runEnsureGlobalCodexAssets(

@@ -431,6 +431,7 @@ export function CustomProviderDialog({
   const runtimeFillTriggerRef = useRef<HTMLButtonElement>(null);
   const modelPickerTriggerRef = useRef<HTMLButtonElement>(null);
   const modelFetchInFlightRef = useRef(false);
+  const dialogScrimRef = useRef<HTMLDivElement>(null);
   const dialogPanelRef = useRef<HTMLDivElement>(null);
   // 原生 window listener 的生命周期不跟着每次 render 重绑；layout effect 只把
   // 已提交的层状态写入 ref，既避开 passive effect 延迟，也不暴露被放弃的并发 render。
@@ -463,6 +464,26 @@ export function CustomProviderDialog({
     if (savingRef.current) return;
     onCloseRef.current();
   }, []);
+
+  useEffect(() => {
+    const onPointerDown = (event: PointerEvent) => {
+      if (
+        event.button !== 0 ||
+        event.target !== dialogScrimRef.current ||
+        savingRef.current ||
+        runtimeFillRef.current
+      ) {
+        return;
+      }
+      // window capture 先于 Radix Popover 的 document capture：由当前层级 owner
+      // 一次性结算该手势，避免菜单先关闭后同一 pointerdown 又误关底层表单。
+      event.preventDefault();
+      event.stopPropagation();
+      dismissTopmostLayer();
+    };
+    window.addEventListener('pointerdown', onPointerDown, { capture: true });
+    return () => window.removeEventListener('pointerdown', onPointerDown, true);
+  }, [dismissTopmostLayer]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1516,19 +1537,8 @@ export function CustomProviderDialog({
 
   return (
     <div
+      ref={dialogScrimRef}
       className="fixed inset-0 z-[10000] flex items-center justify-center bg-[var(--overlay-modal)]"
-      onPointerDown={(event) => {
-        // pointerdown 时先按当前层级结算，避免 Popover 的 outside-dismiss 在随后
-        // click 前把状态改成 closed，令同一次手势继续误关底层表单。
-        if (
-          event.button === 0 &&
-          event.target === event.currentTarget &&
-          !saving &&
-          !runtimeFill
-        ) {
-          dismissTopmostLayer();
-        }
-      }}
       onKeyDown={(event) => {
         if (childLayer || runtimeFill) return;
         if (event.key !== 'Tab') return;

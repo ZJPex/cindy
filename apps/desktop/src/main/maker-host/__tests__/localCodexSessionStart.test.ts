@@ -142,8 +142,8 @@ describe('local codex session start preparation', () => {
       order.push('assets');
       return { skillsProjectionEpoch: 1 };
     });
-    const skillsListCacheNeedsReload = vi.fn((workingDir?: string | null) =>
-      dirtyByCwd.has(workingDir || ''),
+    const codexSkillsListReloadEpoch = vi.fn((workingDir?: string | null) =>
+      dirtyByCwd.has(workingDir || '') ? 1 : null,
     );
     const listAgentSkills = vi.fn(
       async (_opts: { workingDir?: string; forceReload?: boolean }) => {
@@ -151,10 +151,12 @@ describe('local codex session start preparation', () => {
         return { skills: [] };
       },
     );
-    const markCodexSkillsListCacheReloaded = vi.fn((workingDir?: string | null) => {
-      dirtyByCwd.delete(workingDir || '');
-      order.push('mark-reloaded');
-    });
+    const markCodexSkillsListCacheReloaded = vi.fn(
+      (workingDir: string | null | undefined, _reloadedEpoch: number) => {
+        dirtyByCwd.delete(workingDir || '');
+        order.push('mark-reloaded');
+      },
+    );
     const startSession = vi.fn(async () => {
       order.push('start');
       return createHandle('thread-1');
@@ -166,14 +168,14 @@ describe('local codex session start preparation', () => {
       logger: createLogger(),
       lifecycleHooks: {
         onBeforeStart: async ({ agentKind, workingDir, remoteHostId }) => {
-          let needsGlobalSkillsReload = false;
+          let globalSkillsReloadEpoch: number | null = null;
           if (agentKind === 'codex' && !remoteHostId) {
             await ensureGlobalCodexAssets();
-            needsGlobalSkillsReload = skillsListCacheNeedsReload(workingDir);
+            globalSkillsReloadEpoch = codexSkillsListReloadEpoch(workingDir);
           }
-          if (agentKind === 'codex' && !remoteHostId && needsGlobalSkillsReload) {
+          if (agentKind === 'codex' && !remoteHostId && globalSkillsReloadEpoch !== null) {
             await listAgentSkills({ workingDir, forceReload: true });
-            markCodexSkillsListCacheReloaded(workingDir);
+            markCodexSkillsListCacheReloaded(workingDir, globalSkillsReloadEpoch);
           }
         },
       },
@@ -188,21 +190,23 @@ describe('local codex session start preparation', () => {
 
     expect(order).toEqual(['assets', 'force-reload', 'mark-reloaded', 'start']);
     expect(listAgentSkills).toHaveBeenCalledWith({ workingDir: '/repo', forceReload: true });
-    expect(markCodexSkillsListCacheReloaded).toHaveBeenCalledWith('/repo');
+    expect(markCodexSkillsListCacheReloaded).toHaveBeenCalledWith('/repo', 1);
   });
 
   it('keeps skills/list dirty for other cwds after one cwd is force-reloaded', async () => {
     const dirtyByCwd = new Set<string>(['/repo-a', '/repo-b']);
     const ensureGlobalCodexAssets = vi.fn(async () => ({ skillsProjectionEpoch: 1 }));
-    const skillsListCacheNeedsReload = vi.fn((workingDir?: string | null) =>
-      dirtyByCwd.has(workingDir || ''),
+    const codexSkillsListReloadEpoch = vi.fn((workingDir?: string | null) =>
+      dirtyByCwd.has(workingDir || '') ? 1 : null,
     );
     const listAgentSkills = vi.fn(
       async (_opts: { workingDir?: string; forceReload?: boolean }) => ({ skills: [] }),
     );
-    const markCodexSkillsListCacheReloaded = vi.fn((workingDir?: string | null) => {
-      dirtyByCwd.delete(workingDir || '');
-    });
+    const markCodexSkillsListCacheReloaded = vi.fn(
+      (workingDir: string | null | undefined, _reloadedEpoch: number) => {
+        dirtyByCwd.delete(workingDir || '');
+      },
+    );
     const startSession = vi.fn(async () => createHandle('thread-multi-cwd'));
 
     const maker = new Maker({
@@ -211,14 +215,14 @@ describe('local codex session start preparation', () => {
       logger: createLogger(),
       lifecycleHooks: {
         onBeforeStart: async ({ agentKind, workingDir, remoteHostId }) => {
-          let needsGlobalSkillsReload = false;
+          let globalSkillsReloadEpoch: number | null = null;
           if (agentKind === 'codex' && !remoteHostId) {
             await ensureGlobalCodexAssets();
-            needsGlobalSkillsReload = skillsListCacheNeedsReload(workingDir);
+            globalSkillsReloadEpoch = codexSkillsListReloadEpoch(workingDir);
           }
-          if (agentKind === 'codex' && !remoteHostId && needsGlobalSkillsReload) {
+          if (agentKind === 'codex' && !remoteHostId && globalSkillsReloadEpoch !== null) {
             await listAgentSkills({ workingDir, forceReload: true });
-            markCodexSkillsListCacheReloaded(workingDir);
+            markCodexSkillsListCacheReloaded(workingDir, globalSkillsReloadEpoch);
           }
         },
       },
@@ -231,9 +235,9 @@ describe('local codex session start preparation', () => {
       model: 'gpt-5.4',
     });
     expect(listAgentSkills).toHaveBeenCalledWith({ workingDir: '/repo-a', forceReload: true });
-    expect(markCodexSkillsListCacheReloaded).toHaveBeenCalledWith('/repo-a');
-    expect(skillsListCacheNeedsReload('/repo-a')).toBe(false);
-    expect(skillsListCacheNeedsReload('/repo-b')).toBe(true);
+    expect(markCodexSkillsListCacheReloaded).toHaveBeenCalledWith('/repo-a', 1);
+    expect(codexSkillsListReloadEpoch('/repo-a')).toBeNull();
+    expect(codexSkillsListReloadEpoch('/repo-b')).toBe(1);
 
     await maker.createSession({
       id: 'session-b',
@@ -242,8 +246,8 @@ describe('local codex session start preparation', () => {
       model: 'gpt-5.4',
     });
     expect(listAgentSkills).toHaveBeenCalledWith({ workingDir: '/repo-b', forceReload: true });
-    expect(markCodexSkillsListCacheReloaded).toHaveBeenCalledWith('/repo-b');
-    expect(skillsListCacheNeedsReload('/repo-b')).toBe(false);
+    expect(markCodexSkillsListCacheReloaded).toHaveBeenCalledWith('/repo-b', 1);
+    expect(codexSkillsListReloadEpoch('/repo-b')).toBeNull();
   });
 
   it('skips CODEX_HOME asset refresh for remote codex sessions', async () => {

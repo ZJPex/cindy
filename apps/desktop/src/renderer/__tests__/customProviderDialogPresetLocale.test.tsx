@@ -145,12 +145,20 @@ describe('CustomProviderDialog preset locale ownership', () => {
     expect(await screen.findByRole('option', { name: '繁體供應商' })).not.toBeNull();
 
     const scrim = container.firstElementChild as Element;
-    fireEvent.pointerDown(scrim);
-    expect(screen.queryByRole('option', { name: '繁體供應商' })).toBeNull();
-    expect(onClose).not.toHaveBeenCalled();
+    const staleLayerListener = vi.fn();
+    document.addEventListener('pointerdown', staleLayerListener, true);
+    try {
+      fireEvent.pointerDown(scrim);
+      expect(staleLayerListener).not.toHaveBeenCalled();
+      expect(screen.queryByRole('option', { name: '繁體供應商' })).toBeNull();
+      expect(onClose).not.toHaveBeenCalled();
 
-    fireEvent.pointerDown(scrim);
-    expect(onClose).toHaveBeenCalledTimes(1);
+      fireEvent.pointerDown(scrim);
+      expect(staleLayerListener).not.toHaveBeenCalled();
+      expect(onClose).toHaveBeenCalledTimes(1);
+    } finally {
+      document.removeEventListener('pointerdown', staleLayerListener, true);
+    }
   });
 
   it('keeps Cancel as a direct form dismissal without a duplicate top-right button', async () => {

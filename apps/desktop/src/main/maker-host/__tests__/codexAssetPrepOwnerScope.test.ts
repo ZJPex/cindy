@@ -105,8 +105,11 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
       skillsListReloadedEpochByCwd: Map<string, number>;
       pendingAssetsPrep: unknown;
       ensureGlobalCodexAssets: () => Promise<{ skillsProjectionEpoch: number }>;
-      skillsListCacheNeedsReload: (workingDir?: string | null) => boolean;
-      markCodexSkillsListCacheReloaded: (workingDir?: string | null) => void;
+      codexSkillsListReloadEpoch: (workingDir?: string | null) => number | null;
+      markCodexSkillsListCacheReloaded: (
+        workingDir: string | null | undefined,
+        reloadedEpoch: number,
+      ) => void;
       codexSkillsListCacheKey: (workingDir?: string | null) => string;
       runEnsureGlobalCodexAssets: (ownerRoot: string) => Promise<{ skillsProjectionEpoch: number }>;
     };
@@ -122,9 +125,9 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
         configurable: true,
         value: DesktopCodexAuthAdapter.prototype.ensureGlobalCodexAssets,
       },
-      skillsListCacheNeedsReload: {
+      codexSkillsListReloadEpoch: {
         configurable: true,
-        value: DesktopCodexAuthAdapter.prototype.skillsListCacheNeedsReload,
+        value: DesktopCodexAuthAdapter.prototype.codexSkillsListReloadEpoch,
       },
       markCodexSkillsListCacheReloaded: {
         configurable: true,
@@ -144,24 +147,69 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
     });
 
     await expect(adapter.ensureGlobalCodexAssets()).resolves.toEqual({ skillsProjectionEpoch: 1 });
-    expect(adapter.skillsListCacheNeedsReload('/repo-a')).toBe(true);
-    expect(adapter.skillsListCacheNeedsReload('/repo-b')).toBe(true);
+    expect(adapter.codexSkillsListReloadEpoch('/repo-a')).toBe(1);
+    expect(adapter.codexSkillsListReloadEpoch('/repo-b')).toBe(1);
 
-    adapter.markCodexSkillsListCacheReloaded('/repo-a');
-    expect(adapter.skillsListCacheNeedsReload('/repo-a')).toBe(false);
-    expect(adapter.skillsListCacheNeedsReload('/repo-b')).toBe(true);
+    adapter.markCodexSkillsListCacheReloaded('/repo-a', 1);
+    expect(adapter.codexSkillsListReloadEpoch('/repo-a')).toBeNull();
+    expect(adapter.codexSkillsListReloadEpoch('/repo-b')).toBe(1);
 
     Object.defineProperty(adapter, 'runEnsureGlobalCodexAssets', {
       configurable: true,
       value: async () => ({ skillsProjectionEpoch: adapter.skillsProjectionEpoch }),
     });
     await expect(adapter.ensureGlobalCodexAssets()).resolves.toEqual({ skillsProjectionEpoch: 1 });
-    expect(adapter.skillsListCacheNeedsReload('/repo-a')).toBe(false);
-    expect(adapter.skillsListCacheNeedsReload('/repo-b')).toBe(true);
+    expect(adapter.codexSkillsListReloadEpoch('/repo-a')).toBeNull();
+    expect(adapter.codexSkillsListReloadEpoch('/repo-b')).toBe(1);
 
-    adapter.markCodexSkillsListCacheReloaded('/repo-b');
-    expect(adapter.skillsListCacheNeedsReload('/repo-b')).toBe(false);
-    expect(adapter.skillsListCacheNeedsReload(undefined)).toBe(true);
+    adapter.markCodexSkillsListCacheReloaded('/repo-b', 1);
+    expect(adapter.codexSkillsListReloadEpoch('/repo-b')).toBeNull();
+    expect(adapter.codexSkillsListReloadEpoch(undefined)).toBe(1);
     expect(adapter.codexSkillsListCacheKey(undefined)).toBe(harness.homeDir);
+  });
+
+  it('marks only the projection epoch captured before forceReload', async () => {
+    const { DesktopCodexAuthAdapter } = await import('../auth-adapters.js');
+    const adapter = Object.create(DesktopCodexAuthAdapter.prototype) as {
+      skillsProjectionEpoch: number;
+      skillsListReloadedEpochByCwd: Map<string, number>;
+      codexSkillsListReloadEpoch: (workingDir?: string | null) => number | null;
+      markCodexSkillsListCacheReloaded: (
+        workingDir: string | null | undefined,
+        reloadedEpoch: number,
+      ) => void;
+      codexSkillsListCacheKey: (workingDir?: string | null) => string;
+    };
+    Object.defineProperties(adapter, {
+      skillsProjectionEpoch: { configurable: true, writable: true, value: 1 },
+      skillsListReloadedEpochByCwd: {
+        configurable: true,
+        writable: true,
+        value: new Map<string, number>(),
+      },
+      codexSkillsListReloadEpoch: {
+        configurable: true,
+        value: DesktopCodexAuthAdapter.prototype.codexSkillsListReloadEpoch,
+      },
+      markCodexSkillsListCacheReloaded: {
+        configurable: true,
+        value: DesktopCodexAuthAdapter.prototype.markCodexSkillsListCacheReloaded,
+      },
+      codexSkillsListCacheKey: {
+        configurable: true,
+        value: DesktopCodexAuthAdapter.prototype.codexSkillsListCacheKey,
+      },
+    });
+
+    const requestedEpoch = adapter.codexSkillsListReloadEpoch('/repo');
+    expect(requestedEpoch).toBe(1);
+
+    adapter.skillsProjectionEpoch = 2;
+    adapter.markCodexSkillsListCacheReloaded('/repo', requestedEpoch!);
+    expect(adapter.codexSkillsListReloadEpoch('/repo')).toBe(2);
+
+    adapter.markCodexSkillsListCacheReloaded('/repo', 2);
+    adapter.markCodexSkillsListCacheReloaded('/repo', 1);
+    expect(adapter.codexSkillsListReloadEpoch('/repo')).toBeNull();
   });
 });
