@@ -1611,10 +1611,14 @@ export function getMaker(): Maker {
           }
         },
         onBeforeStart: async ({ agentKind, workingDir, remoteHostId }) => {
-          // 延迟记忆重启 pending 时,本地 Codex 新会话加入 shared host 前先尝试
-          // 兑现(其它会话全空闲才会真的重启;仍 busy 则放行,残余窗口见
-          // deferredCodexRestart.ts 模块注释)。
+          // 本地 Codex 会话启动前的统一准备层：所有 maker.createSession 入口
+          // (IPC / scheduler / IM / Orca 等)都会经过 lifecycleHooks.onBeforeStart,
+          // 不能只依赖 maker-ipc 的 bootstrapSession。
           if (agentKind === 'codex' && !remoteHostId) {
+            await desktopCodexAuthAdapter.ensureGlobalCodexAssets();
+            // 延迟记忆重启 pending 时,本地 Codex 新会话加入 shared host 前先尝试
+            // 兑现(其它会话全空闲才会真的重启;仍 busy 则放行,残余窗口见
+            // deferredCodexRestart.ts 模块注释)。
             await _beforeLocalCodexSessionStartHook?.();
           }
           // SSH remote 的 workingDir 属于远端文件系统，本机不能为它创建兼容链接。
