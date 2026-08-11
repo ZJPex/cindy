@@ -92,6 +92,10 @@ function targetLooksGhostRepositoryManaged(target: string, linkName?: string): b
   const expectedGhostId = ghostIdFromLinkName(linkName);
   return segments.some((segment, index) => {
     if (segment !== 'cindy-brain' && segment !== 'brain') return false;
+    // 仅目录名相同不能证明是 Cindy 插件安装根：普通用户 Skill 完全可能位于
+    // /work/brain/<name>/...。插件安装根必须属于 owner 命名空间，避免把这类
+    // 全局 Skill 误投影为 Ghost 后对所有 Profile 禁用。
+    if (segments[index - 2] !== 'owners' || !segments[index - 1]) return false;
     const actualGhostId = segments[index + 1];
     return Boolean(actualGhostId) && (!expectedGhostId || actualGhostId === expectedGhostId);
   });

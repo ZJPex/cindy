@@ -128,6 +128,45 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     );
   });
 
+  it('keeps ordinary global Skills whose paths merely contain a brain segment', async () => {
+    const root = await makeTmpDir();
+    const homeDir = path.join(root, 'home');
+    const codexHome = path.join(root, 'xdt-codex-home');
+    const agentsSkills = path.join(homeDir, '.agents', 'skills');
+    const ownerARoot = path.join(root, 'user-data-a', 'owners', 'owner-a');
+    const ownerBRoot = path.join(root, 'user-data-b', 'owners', 'owner-b');
+    const ownerASkill = await writeInstalledGhostSkill(ownerARoot, 'ghost-a', {
+      dir: 'skills/profile-a',
+      name: 'profile-a',
+    });
+    const ordinarySkill = path.join(root, 'work', 'brain', 'acme', 'deploy');
+    const ownerALink = path.join(agentsSkills, 'ghost-a--profile-a');
+    const ordinaryLink = path.join(agentsSkills, 'acme--deploy');
+    await writeSkill(path.dirname(ordinarySkill), path.basename(ordinarySkill));
+    await linkDirectory(ownerASkill, ownerALink);
+    await linkDirectory(ordinarySkill, ordinaryLink);
+
+    const reportedSkills = [ownerALink, ordinaryLink].map((link) => ({
+      path: path.join(link, 'SKILL.md'),
+    }));
+    await expect(codexDisabledSkillPathsForOwner(reportedSkills, ownerBRoot)).resolves.toEqual([
+      path.join(ownerALink, 'SKILL.md'),
+    ]);
+
+    const result = await prepareCodexGlobalSkillsLinks(codexHome, {
+      homeDir,
+      ownerRoot: ownerBRoot,
+    });
+    const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+    expect(result.warnings).toEqual([]);
+    expect(
+      await sameRealPath(path.join(paths.sharedAgentsSkillsLink, 'acme--deploy'), ordinarySkill),
+    ).toBe(true);
+    await expect(
+      fs.lstat(path.join(paths.sharedAgentsSkillsLink, 'ghost-a--profile-a')),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('keeps owner isolation when Ghost repository roots are relocated links', async () => {
     const root = await makeTmpDir();
     const homeDir = path.join(root, 'home');
