@@ -124,6 +124,23 @@ function managedLinkNameFromSkillPath(skillPath: string): string | undefined {
   return undefined;
 }
 
+async function lexicalManagedLinkTarget(
+  skillPath: string,
+  linkName: string | undefined,
+): Promise<string | null> {
+  if (!linkName) return null;
+  const linkPath = path.dirname(skillPath);
+  if (path.basename(linkPath) !== linkName) return null;
+  try {
+    // realpath 会抹掉 relocated brainRoot 的受管目录段；readlink 保留宿主创建
+    // 链接时的词法目标，供 `<id>--<name>` 与 cindy-brain/<id> 双重核验。
+    const target = await fsp.readlink(linkPath);
+    return normalizeForCompare(path.resolve(path.dirname(linkPath), target));
+  } catch {
+    return null;
+  }
+}
+
 async function collectOwnerInstalledGhostSkills(ownerRoot?: string): Promise<ProjectionEntry[]> {
   const entries = new Map<string, ProjectionEntry>();
   // 与 Ghost 运行时的迁移结果保持一致：新旧目录并存时只认新目录；只有旧目录时
@@ -209,7 +226,11 @@ export async function codexDisabledSkillPathsForOwner(
   for (const skill of skills) {
     const target = (await realPathOrNull(skill.path)) ?? normalizeForCompare(skill.path);
     const linkName = managedLinkNameFromSkillPath(skill.path);
-    if (!targetLooksGhostRepositoryManaged(target, linkName)) {
+    const lexicalTarget = await lexicalManagedLinkTarget(skill.path, linkName);
+    if (
+      !targetLooksGhostRepositoryManaged(target, linkName) &&
+      !(lexicalTarget && targetLooksGhostRepositoryManaged(lexicalTarget, linkName))
+    ) {
       continue;
     }
     const allowedTarget = linkName ? allowedByLinkName.get(linkName) : undefined;
@@ -236,7 +257,13 @@ async function collectOwnerVisibleAgentSkills(
     const target = await realPathOrNull(sourcePath);
     if (!target || !(await isDirectory(sourcePath))) continue;
 
-    const isGhostLink = entry.isSymbolicLink() && targetLooksGhostManaged(target, entry.name);
+    const lexicalTarget = entry.isSymbolicLink()
+      ? await lexicalManagedLinkTarget(path.join(sourcePath, 'SKILL.md'), entry.name)
+      : null;
+    const isGhostLink =
+      entry.isSymbolicLink() &&
+      (targetLooksGhostManaged(target, entry.name) ||
+        Boolean(lexicalTarget && targetLooksGhostManaged(lexicalTarget, entry.name)));
     // 受管 Ghost 链接不能从共享根直接进入投影：它们必须在下方从当前运行时仓库根
     // 重新收集，并通过 manifest 与受限 SKILL.md 的一致性校验。
     if (isGhostLink) continue;

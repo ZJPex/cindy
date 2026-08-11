@@ -128,6 +128,65 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     );
   });
 
+  it('keeps owner isolation when Ghost repository roots are relocated links', async () => {
+    const root = await makeTmpDir();
+    const homeDir = path.join(root, 'home');
+    const codexHome = path.join(root, 'xdt-codex-home');
+    const agentsSkills = path.join(homeDir, '.agents', 'skills');
+    const ownerARoot = path.join(root, 'user-data-a', 'owners', 'owner-a');
+    const ownerBRoot = path.join(root, 'user-data-b', 'owners', 'owner-b');
+    const ownerARepository = path.join(root, 'relocated', 'owner-a-repository');
+    const ownerBRepository = path.join(root, 'relocated', 'owner-b-repository');
+    await fs.mkdir(ownerARepository, { recursive: true });
+    await fs.mkdir(ownerBRepository, { recursive: true });
+    await linkDirectory(ownerARepository, path.join(ownerARoot, 'cindy-brain'));
+    await linkDirectory(ownerBRepository, path.join(ownerBRoot, 'cindy-brain'));
+
+    const ownerASkill = await writeInstalledGhostSkill(ownerARoot, 'ghost-a', {
+      dir: 'agent-skills/profile-a',
+      name: 'profile-a',
+    });
+    const ownerBSkill = await writeInstalledGhostSkill(ownerBRoot, 'ghost-b', {
+      dir: 'agent-skills/profile-b',
+      name: 'profile-b',
+    });
+    const ownerALink = path.join(agentsSkills, 'ghost-a--profile-a');
+    const ownerBLink = path.join(agentsSkills, 'ghost-b--profile-b');
+    await writeSkill(agentsSkills, 'humanizer-zh');
+    await linkDirectory(ownerASkill, ownerALink);
+    await linkDirectory(ownerBSkill, ownerBLink);
+
+    const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+    const result = await prepareCodexGlobalSkillsLinks(codexHome, {
+      homeDir,
+      ownerRoot: ownerBRoot,
+    });
+
+    expect(result.warnings).toEqual([]);
+    await expect(
+      fs.lstat(path.join(paths.sharedAgentsSkillsLink, 'ghost-a--profile-a')),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(
+      await sameRealPath(
+        path.join(paths.sharedAgentsSkillsLink, 'ghost-b--profile-b'),
+        ownerBSkill,
+      ),
+    ).toBe(true);
+    expect(
+      await sameRealPath(
+        path.join(paths.sharedAgentsSkillsLink, 'humanizer-zh'),
+        path.join(agentsSkills, 'humanizer-zh'),
+      ),
+    ).toBe(true);
+
+    await expect(
+      codexDisabledSkillPathsForOwner(
+        [ownerALink, ownerBLink].map((link) => ({ path: path.join(link, 'SKILL.md') })),
+        ownerBRoot,
+      ),
+    ).resolves.toEqual([path.join(ownerALink, 'SKILL.md')]);
+  });
+
   it('ignores unrelated ancestor directories containing a managed-link separator', async () => {
     const root = await makeTmpDir();
     const misleadingHome = path.join(root, 'home--not-a-ghost-link');
