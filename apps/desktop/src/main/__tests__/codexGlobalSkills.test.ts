@@ -82,7 +82,10 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     const ownerARoot = path.join(root, 'user-data-a', 'owners', 'owner-a');
     const ownerBRoot = path.join(root, 'user-data-b', 'owners', 'owner-b');
     const ownerASkill = path.join(ownerARoot, 'cindy-brain', 'ghost-a', 'skills', 'profile-a');
-    const ownerBSkill = path.join(ownerBRoot, 'cindy-brain', 'ghost-b', 'skills', 'profile-b');
+    const ownerBSkill = await writeInstalledGhostSkill(ownerBRoot, 'ghost-b', {
+      dir: 'skills/profile-b',
+      name: 'profile-b',
+    });
     const ownerALegacySkill = path.join(ownerARoot, 'brain', 'ghost-old', 'skills', 'legacy-a');
     const ownerANonstandardSkill = path.join(
       ownerARoot,
@@ -98,7 +101,6 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     const globalSkill = path.join(agentsSkills, 'humanizer-zh');
 
     await writeSkill(path.dirname(ownerASkill), path.basename(ownerASkill));
-    await writeSkill(path.dirname(ownerBSkill), path.basename(ownerBSkill));
     await writeSkill(path.dirname(ownerALegacySkill), path.basename(ownerALegacySkill));
     await writeSkill(path.dirname(ownerANonstandardSkill), path.basename(ownerANonstandardSkill));
     await writeSkill(agentsSkills, 'humanizer-zh');
@@ -163,6 +165,51 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     );
   });
 
+  it('only allows Ghost paths from the runtime-selected repository root', async () => {
+    const root = await makeTmpDir();
+    const agentsSkills = path.join(root, 'home', '.agents', 'skills');
+    const ownerRoot = path.join(root, 'user-data', 'owners', 'owner-a');
+    const activeSkill = await writeInstalledGhostSkill(ownerRoot, 'active-ghost', {
+      dir: 'skills/active',
+      name: 'active',
+    });
+    const legacySkill = await writeInstalledGhostSkill(
+      ownerRoot,
+      'legacy-ghost',
+      { dir: 'skills/legacy', name: 'legacy' },
+      'brain',
+    );
+    const activeLink = path.join(agentsSkills, 'active-ghost--active');
+    const legacyLink = path.join(agentsSkills, 'legacy-ghost--legacy');
+
+    await linkDirectory(activeSkill, activeLink);
+    await linkDirectory(legacySkill, legacyLink);
+
+    await expect(
+      codexDisabledSkillPathsForOwner(
+        [activeLink, legacyLink].map((link) => ({ path: path.join(link, 'SKILL.md') })),
+        ownerRoot,
+      ),
+    ).resolves.toEqual([path.join(legacyLink, 'SKILL.md')]);
+
+    const legacyOnlyOwnerRoot = path.join(root, 'legacy-only-user-data', 'owners', 'owner-b');
+    const legacyOnlySkill = await writeInstalledGhostSkill(
+      legacyOnlyOwnerRoot,
+      'legacy-only-ghost',
+      { dir: 'skills/legacy-only', name: 'legacy-only' },
+      'brain',
+    );
+    const legacyOnlyLink = path.join(agentsSkills, 'legacy-only-ghost--legacy-only');
+    await linkDirectory(legacyOnlySkill, legacyOnlyLink);
+
+    await expect(
+      codexDisabledSkillPathsForOwner(
+        [{ path: path.join(legacyOnlyLink, 'SKILL.md') }],
+        legacyOnlyOwnerRoot,
+      ),
+    ).resolves.toEqual([]);
+  });
+
   it('upgrades the legacy shared-root bridge to an owner-filtered projection', async () => {
     const root = await makeTmpDir();
     const homeDir = path.join(root, 'home');
@@ -170,14 +217,18 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     const agentsSkills = path.join(homeDir, '.agents', 'skills');
     const ownerARoot = path.join(root, 'user-data-a', 'owners', 'owner-a');
     const ownerBRoot = path.join(root, 'user-data-b', 'owners', 'owner-b');
-    const ownerASkill = path.join(ownerARoot, 'cindy-brain', 'ghost-a', 'skills', 'profile-a');
-    const ownerBSkill = path.join(ownerBRoot, 'cindy-brain', 'ghost-b', 'skills', 'profile-b');
+    const ownerASkill = await writeInstalledGhostSkill(ownerARoot, 'ghost-a', {
+      dir: 'skills/profile-a',
+      name: 'profile-a',
+    });
+    const ownerBSkill = await writeInstalledGhostSkill(ownerBRoot, 'ghost-b', {
+      dir: 'skills/profile-b',
+      name: 'profile-b',
+    });
     const ownerALink = path.join(agentsSkills, 'ghost-a--profile-a');
     const ownerBLink = path.join(agentsSkills, 'ghost-b--profile-b');
 
     await writeSkill(agentsSkills, 'user-global');
-    await writeSkill(path.dirname(ownerASkill), path.basename(ownerASkill));
-    await writeSkill(path.dirname(ownerBSkill), path.basename(ownerBSkill));
     await linkDirectory(ownerASkill, ownerALink);
     await linkDirectory(ownerBSkill, ownerBLink);
 
@@ -205,14 +256,18 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     const agentsSkills = path.join(homeDir, '.agents', 'skills');
     const ownerARoot = path.join(root, 'user-data', 'owners', 'owner-a');
     const ownerBRoot = path.join(root, 'user-data', 'owners', 'owner-b');
-    const ownerASkill = path.join(ownerARoot, 'cindy-brain', 'ghost-a', 'skills', 'profile-a');
-    const ownerBSkill = path.join(ownerBRoot, 'cindy-brain', 'ghost-b', 'skills', 'profile-b');
+    const ownerASkill = await writeInstalledGhostSkill(ownerARoot, 'ghost-a', {
+      dir: 'skills/profile-a',
+      name: 'profile-a',
+    });
+    const ownerBSkill = await writeInstalledGhostSkill(ownerBRoot, 'ghost-b', {
+      dir: 'skills/profile-b',
+      name: 'profile-b',
+    });
     const ownerALink = path.join(agentsSkills, 'ghost-a--profile-a');
     const ownerBLink = path.join(agentsSkills, 'ghost-b--profile-b');
 
     await writeSkill(agentsSkills, 'user-global');
-    await writeSkill(path.dirname(ownerASkill), path.basename(ownerASkill));
-    await writeSkill(path.dirname(ownerBSkill), path.basename(ownerBSkill));
     await linkDirectory(ownerASkill, ownerALink);
     await linkDirectory(ownerBSkill, ownerBLink);
 
@@ -261,6 +316,59 @@ describe('prepareCodexGlobalSkillsLinks', () => {
         ownerBSkill,
       ),
     ).toBe(true);
+  });
+
+  it('does not project installed Ghost Skills with untrusted or inconsistent SKILL.md', async () => {
+    const root = await makeTmpDir();
+    const homeDir = path.join(root, 'home');
+    const codexHome = path.join(root, 'xdt-codex-home');
+    const agentsSkills = path.join(homeDir, '.agents', 'skills');
+    const ownerRoot = path.join(root, 'user-data', 'owners', 'owner-a');
+    const inconsistentItem = { dir: 'agent-skills/inconsistent', name: 'inconsistent' };
+    const oversizedItem = { dir: 'agent-skills/oversized', name: 'oversized' };
+    const inconsistentSkill = await writeInstalledGhostSkill(
+      ownerRoot,
+      'inconsistent-ghost',
+      inconsistentItem,
+    );
+    const oversizedSkill = await writeInstalledGhostSkill(
+      ownerRoot,
+      'oversized-ghost',
+      oversizedItem,
+    );
+    await fs.writeFile(
+      path.join(inconsistentSkill, 'SKILL.md'),
+      '---\nname: tampered\ndescription: test skill\n---\n\nbody\n',
+      'utf8',
+    );
+    await fs.appendFile(path.join(oversizedSkill, 'SKILL.md'), 'x'.repeat(64 * 1024), 'utf8');
+    const inconsistentLink = path.join(agentsSkills, 'inconsistent-ghost--inconsistent');
+    const oversizedLink = path.join(agentsSkills, 'oversized-ghost--oversized');
+    await linkDirectory(inconsistentSkill, inconsistentLink);
+    await linkDirectory(oversizedSkill, oversizedLink);
+
+    const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+    const result = await prepareCodexGlobalSkillsLinks(codexHome, { homeDir, ownerRoot });
+
+    expect(result.warnings).toEqual([]);
+    await expect(
+      fs.lstat(path.join(paths.sharedAgentsSkillsLink, 'inconsistent-ghost--inconsistent')),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(
+      fs.lstat(path.join(paths.sharedAgentsSkillsLink, 'oversized-ghost--oversized')),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await sameRealPath(inconsistentLink, inconsistentSkill)).toBe(true);
+    expect(await sameRealPath(oversizedLink, oversizedSkill)).toBe(true);
+    await expect(
+      codexDisabledSkillPathsForOwner(
+        [inconsistentLink, oversizedLink].map((link) => ({
+          path: path.join(link, 'SKILL.md'),
+        })),
+        ownerRoot,
+      ),
+    ).resolves.toEqual(
+      [inconsistentLink, oversizedLink].map((link) => path.join(link, 'SKILL.md')).sort(),
+    );
   });
 
   it('uses only cindy-brain when the active and legacy install roots coexist', async () => {

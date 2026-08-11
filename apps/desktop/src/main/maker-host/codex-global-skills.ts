@@ -6,8 +6,12 @@ import { promises as fsp, type Dirent } from 'node:fs';
 import {
   GHOST_INSTALL_MANIFEST_MAX_BYTES,
   GHOST_MANIFEST_FILE,
+  GHOST_SKILL_MD_MAX_BYTES,
   validateGhostManifest,
 } from '../../shared/ghost.js';
+
+import { checkSkillMdConsistency } from '../cindy-brain/skillSlot.js';
+import { readBoundedFileNoFollow } from '../utils/readBoundedFile.js';
 
 import {
   ensureDirectoryLink,
@@ -64,6 +68,19 @@ async function pathExists(pathname: string): Promise<boolean> {
   }
 }
 
+async function runtimeRepositoryRootForOwner(ownerRoot?: string): Promise<string | null> {
+  if (!ownerRoot) return null;
+  const activeRepositoryRoot = path.join(ownerRoot, 'cindy-brain');
+  try {
+    if (await pathExists(activeRepositoryRoot)) return activeRepositoryRoot;
+    const legacyRepositoryRoot = path.join(ownerRoot, 'brain');
+    return (await pathExists(legacyRepositoryRoot)) ? legacyRepositoryRoot : null;
+  } catch {
+    // 无法确定运行时仓库根时不能放行任何 Ghost Skill。
+    return null;
+  }
+}
+
 function ghostIdFromLinkName(linkName: string | undefined): string | null {
   if (!linkName) return null;
   const separator = linkName.lastIndexOf('--');
@@ -108,16 +125,14 @@ function managedLinkNameFromSkillPath(skillPath: string): string | undefined {
 }
 
 async function collectOwnerInstalledGhostSkills(ownerRoot?: string): Promise<ProjectionEntry[]> {
-  if (!ownerRoot) return [];
   const entries = new Map<string, ProjectionEntry>();
-  const activeRepositoryRoot = path.join(ownerRoot, 'cindy-brain');
   // 与 Ghost 运行时的迁移结果保持一致：新旧目录并存时只认新目录；只有旧目录时
   // 继续兼容迁移失败后的 legacy 根，不能把两个安装清单合并成一个可见集合。
-  const repositoryRoot = (await pathExists(activeRepositoryRoot))
-    ? activeRepositoryRoot
-    : path.join(ownerRoot, 'brain');
-  const repositoryRootCompare =
-    (await realPathOrNull(repositoryRoot)) ?? normalizeForCompare(repositoryRoot);
+  const repositoryRoot = await runtimeRepositoryRootForOwner(ownerRoot);
+  if (!repositoryRoot) return [];
+  const repositoryRootReal = await fsp.realpath(repositoryRoot).catch(() => null);
+  if (!repositoryRootReal) return [];
+  const repositoryRootCompare = normalizeForCompare(repositoryRootReal);
   let ghostDirs: Dirent[];
   try {
     ghostDirs = await fsp.readdir(repositoryRoot, { withFileTypes: true });
@@ -131,14 +146,14 @@ async function collectOwnerInstalledGhostSkills(ownerRoot?: string): Promise<Pro
     const ghostDir = path.join(repositoryRoot, ghostEntry.name);
     const manifestPath = path.join(ghostDir, GHOST_MANIFEST_FILE);
     try {
-      const stat = await fsp.lstat(manifestPath);
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > GHOST_INSTALL_MANIFEST_MAX_BYTES) {
-        continue;
-      }
       if (await pathExists(path.join(ghostDir, GHOST_DISABLED_MARKER_FILE))) continue;
-      const manifestText = await fsp.readFile(manifestPath, 'utf8');
-      if (Buffer.byteLength(manifestText, 'utf8') > GHOST_INSTALL_MANIFEST_MAX_BYTES) continue;
-      const validation = validateGhostManifest(JSON.parse(manifestText));
+      const manifestBytes = await readBoundedFileNoFollow(
+        manifestPath,
+        GHOST_INSTALL_MANIFEST_MAX_BYTES,
+        { containWithin: repositoryRootReal },
+      );
+      if (!manifestBytes) continue;
+      const validation = validateGhostManifest(JSON.parse(manifestBytes.toString('utf8')));
       if (!validation.ok || validation.manifest.id !== ghostEntry.name) continue;
       const manifest = validation.manifest;
       if (!manifest.slots.includes('skill') || !manifest.skill) continue;
@@ -151,6 +166,14 @@ async function collectOwnerInstalledGhostSkills(ownerRoot?: string): Promise<Pro
           !isSameOrInside(target, repositoryRootCompare) ||
           !(await isDirectory(targetPath))
         ) {
+          continue;
+        }
+        const skillMdBytes = await readBoundedFileNoFollow(
+          path.join(targetPath, 'SKILL.md'),
+          GHOST_SKILL_MD_MAX_BYTES,
+          { containWithin: repositoryRootReal },
+        );
+        if (!skillMdBytes || checkSkillMdConsistency(skillMdBytes.toString('utf8'), item)) {
           continue;
         }
         const name = `${manifest.id}--${item.name}`;
@@ -173,17 +196,24 @@ export async function codexDisabledSkillPathsForOwner(
   skills: ReadonlyArray<{ path: string }>,
   ownerRoot?: string,
 ): Promise<string[]> {
-  const ownerRootCompare = ownerRoot
-    ? ((await realPathOrNull(ownerRoot)) ?? normalizeForCompare(ownerRoot))
-    : null;
+  const allowedByLinkName = new Map<string, string>();
+  const allowedTargets = new Set<string>();
+  for (const entry of await collectOwnerInstalledGhostSkills(ownerRoot)) {
+    const skillMdTarget = await realPathOrNull(path.join(entry.target, 'SKILL.md'));
+    if (!skillMdTarget) continue;
+    allowedByLinkName.set(entry.name, skillMdTarget);
+    allowedTargets.add(skillMdTarget);
+  }
   const disabled: string[] = [];
 
   for (const skill of skills) {
     const target = (await realPathOrNull(skill.path)) ?? normalizeForCompare(skill.path);
-    if (!targetLooksGhostRepositoryManaged(target, managedLinkNameFromSkillPath(skill.path))) {
+    const linkName = managedLinkNameFromSkillPath(skill.path);
+    if (!targetLooksGhostRepositoryManaged(target, linkName)) {
       continue;
     }
-    if (!ownerRootCompare || !isSameOrInside(target, ownerRootCompare)) {
+    const allowedTarget = linkName ? allowedByLinkName.get(linkName) : undefined;
+    if (allowedTarget !== target && !(linkName === undefined && allowedTargets.has(target))) {
       disabled.push(skill.path);
     }
   }
@@ -198,9 +228,6 @@ async function collectOwnerVisibleAgentSkills(
   sharedSkillsDir: string,
   ownerRoot?: string,
 ): Promise<ProjectionEntry[]> {
-  const ownerRootCompare = ownerRoot
-    ? ((await realPathOrNull(ownerRoot)) ?? normalizeForCompare(ownerRoot))
-    : null;
   const entries = await fsp.readdir(sharedSkillsDir, { withFileTypes: true });
   const visible = new Map<string, ProjectionEntry>();
 
@@ -210,18 +237,16 @@ async function collectOwnerVisibleAgentSkills(
     if (!target || !(await isDirectory(sourcePath))) continue;
 
     const isGhostLink = entry.isSymbolicLink() && targetLooksGhostManaged(target, entry.name);
-    if (isGhostLink && (!ownerRootCompare || !isSameOrInside(target, ownerRootCompare))) continue;
+    // 受管 Ghost 链接不能从共享根直接进入投影：它们必须在下方从当前运行时仓库根
+    // 重新收集，并通过 manifest 与受限 SKILL.md 的一致性校验。
+    if (isGhostLink) continue;
     visible.set(entry.name, { name: entry.name, target });
   }
 
   for (const ownerEntry of await collectOwnerInstalledGhostSkills(ownerRoot)) {
-    const existing = visible.get(ownerEntry.name);
-    // Preserve an unmanaged user entry on collision, matching skillSlot's
-    // no-clobber rule. A managed link may be replaced inside this private
-    // projection without mutating the cross-profile shared root.
-    if (!existing || targetLooksGhostManaged(existing.target, existing.name)) {
-      visible.set(ownerEntry.name, ownerEntry);
-    }
+    // 共享根里的受管 Ghost 已在上方统一跳过；若仍有同名条目，它就是不应覆盖的
+    // 普通用户目录或外来链接，继续遵守 skillSlot 的 no-clobber 规则。
+    if (!visible.has(ownerEntry.name)) visible.set(ownerEntry.name, ownerEntry);
   }
 
   return [...visible.values()].sort((a, b) => a.name.localeCompare(b.name));
