@@ -9379,7 +9379,8 @@
     },
     "currentSubscription": {
       "title": "現在のサブスクリプション",
-      "purchaseBlocked": "未終了のサブスクリプションがあります。既存のサブスクリプションを処理してから新しいプランを購入してください。"
+      "purchaseBlocked": "未終了のサブスクリプションがあります。既存のサブスクリプションを処理してから新しいプランを購入してください。",
+      "purchaseBlockedUntilPeriodEnd": "現在のプランは {{date}} に終了します。終了後に新しいプランを購入できます。"
     },
     "subscriptionStatus": {
       "INCOMPLETE": "支払い待ち",

@@ -9393,7 +9393,8 @@
     },
     "currentSubscription": {
       "title": "Current subscription",
-      "purchaseBlocked": "You already have an unfinished subscription. Manage it before purchasing another plan."
+      "purchaseBlocked": "You already have an unfinished subscription. Manage it before purchasing another plan.",
+      "purchaseBlockedUntilPeriodEnd": "Your current plan ends {{date}}. You can purchase a new plan after it ends."
     },
     "subscriptionStatus": {
       "INCOMPLETE": "Awaiting payment",

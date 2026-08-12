@@ -9379,7 +9379,8 @@
     },
     "currentSubscription": {
       "title": "현재 구독",
-      "purchaseBlocked": "종료되지 않은 구독이 있습니다. 기존 구독을 처리한 후 새 요금제를 구매하세요."
+      "purchaseBlocked": "종료되지 않은 구독이 있습니다. 기존 구독을 처리한 후 새 요금제를 구매하세요.",
+      "purchaseBlockedUntilPeriodEnd": "현재 요금제는 {{date}}에 종료됩니다. 종료 후 새 요금제를 구매할 수 있습니다."
     },
     "subscriptionStatus": {
       "INCOMPLETE": "결제 대기",
