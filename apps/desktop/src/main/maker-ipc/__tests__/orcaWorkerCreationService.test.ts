@@ -1488,6 +1488,103 @@ describe('OrcaWorkerCreationService', () => {
     }));
   });
 
+  it('prefers a compatible Lead route before a cached New Maker route', async () => {
+    const { deps, service } = createDeps({
+      getLeadSessionRow: vi.fn(async () => ({
+        id: 'lead-1',
+        agentKind: 'claude-code' as const,
+        workspaceKind: 'project' as const,
+        workingDir: '/repo',
+        model: 'claude-opus-5',
+        effort: 'high',
+        permissionMode: 'default',
+        fastMode: false,
+        providerId: 'anthropic',
+        remoteHostId: null,
+      })),
+      getWorkerDefaults: vi.fn(() => ({
+        model: 'claude-sonnet-4-6',
+        providerId: 'xd',
+      })),
+      getProviderRoutingContext: vi.fn(async () => providerRoutingContext({
+        'claude-code': [
+          { id: 'xd', name: 'Cindy AI', models: ['claude-sonnet-4-6'] },
+          {
+            id: 'anthropic',
+            name: 'Anthropic',
+            models: ['claude-opus-5', 'claude-sonnet-4-6'],
+          },
+        ],
+      })),
+    });
+
+    await expect(service.createWorker({
+      leadSessionId: 'lead-1',
+      role: 'developer',
+      agent: 'claude-code',
+      label: 'developer',
+    })).resolves.toMatchObject({
+      ok: true,
+      resolved: { providerId: 'anthropic', model: 'claude-sonnet-4-6' },
+    });
+    expect(deps.buildCreateOptsWithStderr).toHaveBeenCalledWith(expect.objectContaining({
+      providerId: 'anthropic',
+      model: 'claude-sonnet-4-6',
+    }));
+  });
+
+  it.each([
+    {
+      name: 'trims a cached provider ID before inheriting it',
+      providerId: ' custom-codex ',
+      expectedProviderId: 'custom-codex',
+    },
+    {
+      name: 'treats a whitespace-only cached provider ID as not selected',
+      providerId: '   ',
+      expectedProviderId: 'xd',
+    },
+  ])('$name', async ({ providerId, expectedProviderId }) => {
+    const cachedDefaults = { model: 'gpt-5.4', providerId };
+    const { deps, service } = createDeps({
+      getLeadSessionRow: vi.fn(async () => ({
+        id: 'lead-1',
+        agentKind: 'claude-code' as const,
+        workspaceKind: 'project' as const,
+        workingDir: '/repo',
+        model: 'claude-sonnet-4-6',
+        effort: 'high',
+        permissionMode: 'default',
+        fastMode: false,
+        providerId: 'anthropic',
+        remoteHostId: null,
+      })),
+      getWorkerDefaults: vi.fn(() => cachedDefaults),
+      getProviderRoutingContext: vi.fn(async () => providerRoutingContext({
+        'claude-code': [],
+        codex: [
+          { id: 'xd', name: 'Cindy AI', models: ['gpt-5.4'] },
+          { id: 'custom-codex', name: 'Custom Codex', models: ['gpt-5.4'] },
+        ],
+      })),
+    });
+
+    await expect(service.createWorker({
+      leadSessionId: 'lead-1',
+      role: 'reviewer',
+      agent: 'codex',
+      label: 'reviewer',
+    })).resolves.toMatchObject({
+      ok: true,
+      resolved: { providerId: expectedProviderId, model: 'gpt-5.4' },
+    });
+    expect(cachedDefaults.providerId).toBe(providerId);
+    expect(deps.buildCreateOptsWithStderr).toHaveBeenCalledWith(expect.objectContaining({
+      providerId: expectedProviderId,
+      model: 'gpt-5.4',
+    }));
+  });
+
   it('keeps the compatible Anthropic Lead route for an explicit Claude Worker model', async () => {
     const { deps, service } = createDeps({
       getLeadSessionRow: vi.fn(async () => ({
