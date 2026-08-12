@@ -182,8 +182,8 @@ export interface OrcaWorkerCreateParams {
   /**
    * 显式选定的模型来源(标准模型选择面板的 per-worker 选择)。string = 显式来源,
    * 走下方精确 preflight 校验「已连接且提供该模型」,不满足即失败,不静默换路由;
-   * undefined / null = 未显式选择,沿用 defaults 缓存 / Lead 继承 / spawn-aware
-   * 默认路由的既有解析(含 requiresExplicitRoute 唯一来源救援与 stale 回落)。
+   * undefined / null = 未显式选择,沿用有效的 defaults / Lead 来源,否则解析并保存
+   * 当前默认来源。Lead 已绑定但当前断连的来源会在创建前失败,不静默改走其它凭证。
    */
   providerId?: string | null;
   initialTask?: string;
@@ -702,10 +702,14 @@ export function createOrcaWorkerCreationService(deps: OrcaWorkerCreationDeps): O
       lead,
       defaults,
     });
+    const leadProviderId =
+      params.agent === lead.agentKind && typeof lead.providerId === 'string' && lead.providerId.trim()
+        ? lead.providerId.trim()
+        : null;
     const inheritedProviderId = explicitSourceId
       ?? (inheritedModelComesFromDefaults
         ? (defaults.providerId ?? null)
-        : (params.agent === lead.agentKind ? lead.providerId : null));
+        : leadProviderId);
     const cachedProviderMayFallback =
       explicitSourceId === null
       && inheritedModelComesFromDefaults
@@ -733,15 +737,10 @@ export function createOrcaWorkerCreationService(deps: OrcaWorkerCreationDeps): O
     if (!resolvedConfig.ok) {
       return { ok: false, errorCode: 'INVALID_PARAMS', message: resolvedConfig.message };
     }
-    const explicitModelDefaultProviderId = params.model !== undefined
-      ? providerRouting.resolveDefaultProviderIdForModel(params.agent, resolvedConfig.model)
-      : null;
-    const explicitModelProviders = params.model !== undefined
-      ? agentProviders.filter((provider) => provider.models.includes(resolvedConfig.model))
-      : [];
-    const explicitModelProvider = explicitModelDefaultProviderId === null
-      ? undefined
-      : agentProviders.find((provider) => provider.id === explicitModelDefaultProviderId);
+    const defaultProviderId = providerRouting.resolveDefaultProviderIdForModel(
+      params.agent,
+      resolvedConfig.model,
+    );
     const cachedProviderRouteIsStale = params.model === undefined
       && inheritedModelComesFromDefaults
       && defaults.providerId !== undefined
@@ -749,40 +748,33 @@ export function createOrcaWorkerCreationService(deps: OrcaWorkerCreationDeps): O
       && !agentProviders.some(
         (provider) => provider.id === defaults.providerId && provider.models.includes(resolvedConfig.model),
       );
-    const modelOnlyDefaultNeedsRouteResolution = params.model === undefined
-      && inheritedModelComesFromDefaults
-      && (defaults.providerId === undefined || defaults.providerId === null);
-    const inheritedDefaultNeedsRouteResolution =
-      cachedProviderRouteIsStale || modelOnlyDefaultNeedsRouteResolution;
-    const inheritedDefaultProviderId = inheritedDefaultNeedsRouteResolution
-      ? providerRouting.resolveDefaultProviderIdForModel(params.agent, resolvedConfig.model)
-      : null;
-    const inheritedDefaultProvider = inheritedDefaultProviderId === null
+    const inheritedProviderSnapshot = inheritedProviderId === null
       ? undefined
-      : agentProviders.find((provider) => provider.id === inheritedDefaultProviderId);
+      : agentProviders.find((provider) => provider.id === inheritedProviderId);
+    const inheritedProvider = inheritedProviderSnapshot?.models.includes(resolvedConfig.model)
+      ? inheritedProviderSnapshot
+      : undefined;
+    const inheritedLeadProviderUnusable =
+      explicitSourceId === null
+      && !inheritedModelComesFromDefaults
+      && leadProviderId !== null
+      && selectedModel === lead.model
+      && inheritedProvider === undefined;
     const resolved = {
       ...resolvedConfig,
-      // 仅显式指定 model 不等于显式选择来源：providerId=null 必须保留 spawn-aware 默认路由。
-      // 例外是该模型只有一个来源且它必须依赖 session provider store 注入自己的凭证。
-      providerId: explicitSourceId !== null
-        ? explicitSourceId
-        : params.model !== undefined
-          && explicitModelProviders.length === 1
-          && explicitModelProvider?.requiresExplicitRoute
-          ? explicitModelProvider.id
-          : params.model !== undefined
-            ? null
-            : inheritedDefaultNeedsRouteResolution
-              ? (inheritedDefaultProvider?.requiresExplicitRoute ? inheritedDefaultProvider.id : null)
-              : resolvedConfig.providerId,
+      // Worker session 必须保存实际生效的来源身份，凭证层才能把官方订阅解析为
+      // oauth-bearer。显式来源优先；否则保留仍提供目标模型的 Lead/default 来源；
+      // Lead 已绑定但当前断连时保留其意图交给下方 preflight 明确拒绝，不能静默改走
+      // Cindy AI；仅 defaults 失效或来源不提供目标模型时回落当前默认来源。
+      providerId: explicitSourceId
+        ?? inheritedProvider?.id
+        ?? (inheritedLeadProviderUnusable ? leadProviderId : defaultProviderId),
     };
     // Fast 与 effort 都按**实际路由来源**自己的模型条目判定(显式来源、defaults 缓存
     // 来源、spawn 默认来源统一)—— getAvailableModels 是跨来源拍平清单(首来源 wins,
     // 且不含连接态),同 id 模型的 supportsFastMode / efforts 在不同来源可分叉:首来源
     // 的元数据会误杀或误放行真实路由来源的能力(codex review 三轮)。
-    const routeProviderId = explicitSourceId
-      ?? resolved.providerId
-      ?? providerRouting.resolveDefaultProviderIdForModel(params.agent, resolved.model);
+    const routeProviderId = resolved.providerId ?? defaultProviderId;
     const routeProvider = routeProviderId === null
       ? undefined
       : agentProviders.find((provider) => provider.id === routeProviderId);
@@ -820,11 +812,7 @@ export function createOrcaWorkerCreationService(deps: OrcaWorkerCreationDeps): O
     } else if (resolvedConfig.pendingEffortError) {
       return { ok: false, errorCode: 'INVALID_PARAMS', message: resolvedConfig.pendingEffortError };
     }
-    const budgetRouteProviderId = explicitSourceId !== null
-      ? explicitSourceId
-      : params.model !== undefined
-        ? explicitModelDefaultProviderId
-        : (inheritedDefaultNeedsRouteResolution ? inheritedDefaultProviderId : resolved.providerId);
+    const budgetRouteProviderId = resolved.providerId;
 
     // codex/ 预算模型依赖 Cindy AI API key；XD/default 路由即使因 provider 缺失，
     // 也要先返回这条可操作的凭证错误，避免被下方通用的精确路由失败遮蔽。
@@ -856,12 +844,8 @@ export function createOrcaWorkerCreationService(deps: OrcaWorkerCreationDeps): O
             'subscription-direct models require the local proxy path — pick an SSH-compatible model',
         };
       }
-      // 默认路由 (resolved.providerId=null) 同样要闸 — 且必须按
-      // routeProviderId/routeProvider (上方 583 行) 判定:它已经
-      // 「显式来源 → resolved → resolveDefaultProviderIdForModel」解析出
-      // 实际落点;budgetRouteProviderId 在 worker 未显式传 model 时仍为
-      // null, 只查它会让默认路由的 chat-bridged 漏过 (codex-connector
-      // R24 P2)。
+      // 未显式来源的 Worker 也必须按最终持久化的实际 routeProvider 判定；否则
+      // 默认来源上的 chat-bridged provider 会漏过远端兼容闸。
       if (routeProvider?.chatBridgedCodex === true) {
         return {
           ok: false,
@@ -875,7 +859,7 @@ export function createOrcaWorkerCreationService(deps: OrcaWorkerCreationDeps): O
 
     if (
       params.model !== undefined
-      && explicitModelDefaultProviderId === null
+      && defaultProviderId === null
       && explicitSourceId === null
     ) {
       return {
@@ -890,7 +874,7 @@ export function createOrcaWorkerCreationService(deps: OrcaWorkerCreationDeps): O
       };
     }
 
-    if (cachedProviderRouteIsStale && inheritedDefaultProviderId === null) {
+    if (cachedProviderRouteIsStale && defaultProviderId === null) {
       return {
         ok: false,
         errorCode: 'PROVIDER_ROUTE_UNAVAILABLE',

@@ -1,4 +1,4 @@
-import type { AgentKind } from '@cindy/maker-core';
+import { resolveAgentCredentialMode, type AgentKind } from '@cindy/maker-core';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -713,13 +713,13 @@ describe('OrcaWorkerCreationService', () => {
 
       await expect(service.createWorker(workerParams())).resolves.toMatchObject({
         ok: true,
-        resolved: { model: canonicalId, providerId: null },
+        resolved: { model: canonicalId, providerId: 'xd' },
       });
 
       expect(legacyDefaults).toEqual({ model: shortId, providerId: 'deleted-custom' });
       expect(deps.buildCreateOptsWithStderr).toHaveBeenCalledWith(expect.objectContaining({
         model: canonicalId,
-        providerId: null,
+        providerId: 'xd',
       }));
     });
 
@@ -1488,7 +1488,92 @@ describe('OrcaWorkerCreationService', () => {
     }));
   });
 
-  it('falls back from a stale New Maker provider to the current native default route', async () => {
+  it('keeps the compatible Anthropic Lead route for an explicit Claude Worker model', async () => {
+    const { deps, service } = createDeps({
+      getLeadSessionRow: vi.fn(async () => ({
+        id: 'lead-1',
+        agentKind: 'claude-code' as const,
+        workspaceKind: 'project' as const,
+        workingDir: '/repo',
+        model: 'claude-opus-5',
+        effort: 'high',
+        permissionMode: 'default',
+        fastMode: false,
+        providerId: 'anthropic',
+        remoteHostId: null,
+      })),
+      getAvailableModels: vi.fn(() => [
+        { id: 'claude-opus-5', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'high' },
+      ]),
+      getProviderRoutingContext: vi.fn(async () => providerRoutingContext({
+        'claude-code': [
+          { id: 'xd', name: 'Cindy AI', models: ['claude-opus-5'] },
+          { id: 'anthropic', name: 'Anthropic', models: ['claude-opus-5'] },
+        ],
+      })),
+    });
+
+    const result = await service.createWorker({
+      leadSessionId: 'lead-1',
+      role: 'developer',
+      agent: 'claude-code',
+      label: 'developer',
+      model: 'claude-opus-5',
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      resolved: { providerId: 'anthropic', model: 'claude-opus-5' },
+    });
+    expect(deps.buildCreateOptsWithStderr).toHaveBeenCalledWith(expect.objectContaining({
+      providerId: 'anthropic',
+      model: 'claude-opus-5',
+    }));
+    expect(resolveAgentCredentialMode({
+      agentKind: 'claude-code',
+      providerId: result.ok ? result.resolved.providerId : null,
+      model: result.ok ? result.resolved.model : null,
+    })).toBe('oauth-bearer');
+  });
+
+  it('rejects a missing Anthropic Lead route before falling back to Cindy AI', async () => {
+    const { deps, service } = createDeps({
+      getLeadSessionRow: vi.fn(async () => ({
+        id: 'lead-1',
+        agentKind: 'claude-code' as const,
+        workspaceKind: 'project' as const,
+        workingDir: '/repo',
+        model: 'claude-opus-5',
+        effort: 'high',
+        permissionMode: 'default',
+        fastMode: false,
+        providerId: 'anthropic',
+        remoteHostId: null,
+      })),
+      getAvailableModels: vi.fn(() => [
+        { id: 'claude-opus-5', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'high' },
+      ]),
+      getProviderRoutingContext: vi.fn(async () => providerRoutingContext({
+        'claude-code': [{ id: 'xd', name: 'Cindy AI', models: ['claude-opus-5'] }],
+      })),
+    });
+
+    await expect(service.createWorker({
+      leadSessionId: 'lead-1',
+      role: 'developer',
+      agent: 'claude-code',
+      label: 'developer',
+      model: 'claude-opus-5',
+    })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'PROVIDER_ROUTE_UNAVAILABLE',
+      message: expect.stringContaining('"anthropic" 当前未连接'),
+    });
+    expect(deps.reserveWorkerCreation).not.toHaveBeenCalled();
+    expect(deps.bootstrapSession).not.toHaveBeenCalled();
+  });
+
+  it('persists the current native route when a stale New Maker provider falls back', async () => {
     const { deps, service } = createDeps({
       getWorkerDefaults: vi.fn(() => ({ model: 'gpt-5.4', providerId: 'deleted-custom' })),
       getProviderRoutingContext: vi.fn(async () => providerRoutingContext({
@@ -1504,11 +1589,11 @@ describe('OrcaWorkerCreationService', () => {
       label: 'reviewer',
     })).resolves.toMatchObject({
       ok: true,
-      resolved: { providerId: null, model: 'gpt-5.4' },
+      resolved: { providerId: 'xd', model: 'gpt-5.4' },
     });
 
     expect(deps.buildCreateOptsWithStderr).toHaveBeenCalledWith(expect.objectContaining({
-      providerId: null,
+      providerId: 'xd',
       model: 'gpt-5.4',
     }));
   });
@@ -1543,7 +1628,7 @@ describe('OrcaWorkerCreationService', () => {
     }));
   });
 
-  it('keeps a model-only legacy default on the current native default route', async () => {
+  it('persists the current native route for a model-only legacy default', async () => {
     const { deps, service } = createDeps({
       getWorkerDefaults: vi.fn(() => ({ model: 'gpt-5.5' })),
     });
@@ -1555,11 +1640,11 @@ describe('OrcaWorkerCreationService', () => {
       label: 'reviewer',
     })).resolves.toMatchObject({
       ok: true,
-      resolved: { providerId: null, model: 'gpt-5.5' },
+      resolved: { providerId: 'xd', model: 'gpt-5.5' },
     });
 
     expect(deps.buildCreateOptsWithStderr).toHaveBeenCalledWith(expect.objectContaining({
-      providerId: null,
+      providerId: 'xd',
     }));
   });
 
@@ -1596,7 +1681,7 @@ describe('OrcaWorkerCreationService', () => {
     }));
   });
 
-  it('keeps the default route while validating connected sources when only the worker model is explicit', async () => {
+  it('persists the default route while validating connected sources when only the worker model is explicit', async () => {
     const availability = {
       'claude-code': [],
       codex: [
@@ -1618,11 +1703,11 @@ describe('OrcaWorkerCreationService', () => {
       model: 'gpt-5.4',
     })).resolves.toMatchObject({
       ok: true,
-      resolved: { providerId: null, model: 'gpt-5.4' },
+      resolved: { providerId: 'xd', model: 'gpt-5.4' },
     });
 
     expect(deps.buildCreateOptsWithStderr).toHaveBeenCalledWith(expect.objectContaining({
-      providerId: null,
+      providerId: 'xd',
       model: 'gpt-5.4',
     }));
   });
@@ -1921,7 +2006,7 @@ describe('buildNoProviderMessage', () => {
     }));
   });
 
-  it('treats an empty-string providerId as not-explicit and keeps the forced default route', async () => {
+  it('treats an empty-string providerId as not-explicit and persists the resolved route', async () => {
     const { service } = createDeps();
 
     await expect(service.createWorker({
@@ -1933,8 +2018,8 @@ describe('buildNoProviderMessage', () => {
       providerId: '',
     })).resolves.toMatchObject({
       ok: true,
-      // 与「显式 model 未显式来源」同语义:providerId 强制默认路由,不进显式 preflight。
-      resolved: { providerId: null, model: 'gpt-5.5' },
+      // 与「显式 model 未显式来源」同语义：不进显式 preflight，但保存实际默认来源。
+      resolved: { providerId: 'xd', model: 'gpt-5.5' },
     });
   });
 
