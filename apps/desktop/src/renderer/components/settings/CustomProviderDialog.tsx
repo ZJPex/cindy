@@ -1609,12 +1609,19 @@ export function CustomProviderDialog({
                 locale={i18n.language}
                 open={presetMenuOpen}
                 onOpenChange={(open) => {
-                  setChildLayer((current) => {
-                    if (open) {
-                      return current?.kind === 'model-picker' ? current : { kind: 'preset-menu' };
-                    }
-                    return current?.kind === 'preset-menu' ? null : current;
-                  });
+                  // Radix 可以在 React 尚未提交本次状态更新时收到下一个原生手势。
+                  // 先同步认领 layer owner，确保 window-capture 不会把刚打开的菜单
+                  // 误判成「没有子层」并关闭底层表单；state 仍负责实际呈现。
+                  const current = childLayerRef.current;
+                  const next: DialogChildLayer = open
+                    ? current?.kind === 'model-picker'
+                      ? current
+                      : { kind: 'preset-menu' }
+                    : current?.kind === 'preset-menu'
+                      ? null
+                      : current;
+                  childLayerRef.current = next;
+                  setChildLayer(next);
                 }}
               />
             </div>

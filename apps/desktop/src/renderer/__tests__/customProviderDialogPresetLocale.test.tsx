@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -159,6 +159,23 @@ describe('CustomProviderDialog preset locale ownership', () => {
     } finally {
       document.removeEventListener('pointerdown', staleLayerListener, true);
     }
+  });
+
+  it('claims the preset layer before a batched scrim gesture can dismiss the form', async () => {
+    i18nState.language = 'zh-TW';
+    const { container, onClose } = renderDialog();
+
+    const trigger = await screen.findByRole('button', {
+      name: 'settings.providers.custom.presets.label',
+    });
+    const scrim = container.firstElementChild as Element;
+
+    act(() => {
+      trigger.dispatchEvent(new MouseEvent('click', { bubbles: true, button: 0 }));
+      scrim.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, button: 0 }));
+    });
+
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it('keeps Cancel as a direct form dismissal without a duplicate top-right button', async () => {
