@@ -86,6 +86,10 @@ import {
   type ActiveAppSession,
 } from '../appSessionState.js';
 import {
+  assertGhostSkillProjectionBoundaryStableForOwner,
+  withSharedGlobalSkillProjectionMutation,
+} from '../authBoundaryQuarantine.js';
+import {
   bindNativeProviderAuth,
   claimDetectedNativeProviderAuth,
   isNativeProviderAuthBound,
@@ -494,7 +498,13 @@ export class DesktopClaudeAuthAdapter implements AuthAdapter {
 
   private async runEnsureSharedGlobalSkills(): Promise<void> {
     try {
-      const result = await prepareSharedGlobalSkillLinks();
+      const ownerId = getActiveAppSession().dataOwnerId;
+      const result = await withSharedGlobalSkillProjectionMutation(ownerId, () =>
+        prepareSharedGlobalSkillLinks({
+          assertOwnerStable: () =>
+            assertGhostSkillProjectionBoundaryStableForOwner(ownerId),
+        }),
+      );
       for (const warning of result.warnings) {
         assetPrepLog.warn('shared global skill warning', { warning });
       }
@@ -1113,7 +1123,13 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
   ): Promise<{ skillsProjectionEpoch: number }> {
     // Load-bearing order: Codex skill linking scans ~/.agents/skills, so shared
     // links must populate that directory before prepareCodexGlobalSkillsLinks runs.
-    const sharedOutcome = await prepareSharedGlobalSkillLinks().then(
+    const ownerId = getActiveAppSession().dataOwnerId;
+    const sharedOutcome = await withSharedGlobalSkillProjectionMutation(ownerId, () =>
+      prepareSharedGlobalSkillLinks({
+        assertOwnerStable: () =>
+          assertGhostSkillProjectionBoundaryStableForOwner(ownerId),
+      }),
+    ).then(
       (r) => ({ ok: true as const, label: 'shared-skills' as const, warnings: r.warnings }),
       (err: Error) => ({ ok: false as const, label: 'shared-skills' as const, err }),
     );
