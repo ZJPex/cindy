@@ -166,6 +166,7 @@ import {
   prepare as binaryPrepare,
   peekNeedsDownload as binaryPeekNeedsDownload,
   broadcastResetForStep as binaryBroadcastResetForStep,
+  getCachedBinaryStatus,
   type AgentBinaryKind,
   type PrepareResult,
 } from './agent-binaries';
@@ -583,6 +584,13 @@ import {
   resetSubagentModelSettings,
   writeSubagentModelSettingsPatch,
 } from './maker-host/subagent-model-settings-store.js';
+import {
+  readVisionBridgeSettings,
+  readVisionBridgeSettingsState,
+  resetVisionBridgeSettings,
+  writeVisionBridgeSettings,
+} from './vision-bridge/vision-bridge-settings-store.js';
+import type { VisionBridgeSettings } from '../shared/visionBridgeSettings.js';
 import { readLspModeSettings, writeLspModeEnabled } from './maker-host/lsp-mode-store.js';
 import {
   readChatEmbeddingSettings,
@@ -643,6 +651,7 @@ import {
 } from './sessionDragPreviewHtml.js';
 import {
   isGlobalVoiceInputOverlayVisible,
+  releaseActiveGlobalVoiceInputShortcut,
   registerGlobalVoiceInputIpc,
 } from './voice-input/global.js';
 import { ensureMainAppPresence } from './appPresence.js';
@@ -3502,6 +3511,24 @@ const registerIpcHandlers = () => {
     }, stillValid);
   });
 
+  // 视觉桥设置 IPC —— store 与 Maker 单例无关, 提前注册（见 vision-bridge-settings-store）。
+  // GET 也是特权配置面读取（providerId/modelId/开关），非可信 sender 同样拒绝（与 SET/RESET 对齐）。
+  ipcMain.handle(MAKER_IPC_INVOKE.VISION_BRIDGE_SETTINGS_GET, async (event) => {
+    assertTrustedAppRendererEvent(event);
+    return visionBridgeSettingsWire();
+  });
+  ipcMain.handle(MAKER_IPC_INVOKE.VISION_BRIDGE_SETTINGS_SET, async (event, patch: unknown) => {
+    assertTrustedAppRendererEvent(event);
+    const parsed = parseVisionBridgeSettingsPatch(patch);
+    writeVisionBridgeSettings(parsed);
+    return visionBridgeSettingsWire();
+  });
+  ipcMain.handle(MAKER_IPC_INVOKE.VISION_BRIDGE_SETTINGS_RESET, async (event) => {
+    assertTrustedAppRendererEvent(event);
+    resetVisionBridgeSettings();
+    return visionBridgeSettingsWire();
+  });
+
   // Claude Code 自动上下文压缩阈值 IPC —— store 跟 Maker 单例无关, 提前注册。
   // buildDesktopClaudeRuntimeConfig.behaviorFlags 是动态 getter, 下个新 session 读到新值。
   ipcMain.handle(MAKER_IPC_INVOKE.SILENT_ENCRYPTED_RETRY_GET, async () => {
@@ -4872,6 +4899,14 @@ const registerIpcHandlers = () => {
     resetBeforeSegment('pi', claudeRes.downloaded === true || codexRes.downloaded === true);
 
     let piInfo: { status: 'passed' | 'failed'; path?: string; error?: string };
+    // 轮 27 LOW-4:首次准备失败后账号切换(同一进程),二进制可能已由后台
+    // 下载/手动放置变得可用 —— 轻量重试:意外可用则清除标志继续准备。
+    if (piDisabledForLaunch) {
+      const cached = getCachedBinaryStatus('pi');
+      if (cached?.binaryPath && cached.binaryPath.length > 0) {
+        piDisabledForLaunch = false;
+      }
+    }
     if (piDisabledForLaunch) {
       piInfo = {
         status: 'failed' as const,
@@ -7170,6 +7205,7 @@ app.on('ready', async () => {
   // 设备只剩隐私指示灯常亮和 idle-sleep assertion 的代价)。
   installVoiceInputPowerRelease({
     powerMonitor,
+    releaseActiveShortcut: releaseActiveGlobalVoiceInputShortcut,
     broadcast: (channel, payload) => {
       broadcastVoiceInputPowerState(
         BrowserWindow.getAllWindows(),
@@ -7282,7 +7318,12 @@ onQuit('review-artifact-snapshots', cleanupActiveReviewArtifactSnapshots, 'async
 onQuit('orca-idle-watcher', () => stopOrcaIdleWatcher(), 'sync');
 onQuit('im', () => stopImConnection('quit'), 'async');
 onQuit('codex-env', () => shutdownCodexEnvironment(), 'async');
-onQuit('pi-env', () => shutdownPiEnvironment(), 'async');
+// 轮 27 MEDIUM-3:pi-env 挪到 post-async —— 若与 shutdown-maker 同 async 并发,
+// bridge 可能在 session close 的 disposeSessionRegistrations(unregisterSessionCtx/
+// Token)之前关闭, 产生「pi dispose session registration failed (non-fatal)」
+// 日志噪声。post-async 串行在 shutdown-maker(async)之后执行, 且注册顺序在
+// remote-ssh-pool 之前(两者同 post-async, 按注册序执行 —— bridge 先于 pool 关)。
+onQuit('pi-env', () => shutdownPiEnvironment(), 'post-async');
 // embedding-host: abort 语义 —— 立刻让出 SQLite 写连接, 不等当前 tick (那批 job 保持
 // pending 下次续跑, 写事务同步原子无中断)。
 onQuit('embedding-host', () => stopEmbeddingHost(), 'async');
@@ -7299,7 +7340,11 @@ onQuit('codex-proxy', () => disposeCodexProxy(), 'async');
 // Remote file-service clients: 先于 pool 关闭, 挂断远端 daemon 的 exec channel。
 onQuit('remote-file-browser', () => disposeRemoteFileBrowser(), 'async');
 // Remote SSH pool: 主动断开所有活动连接, 防止 ssh2 子句柄阻塞 Node 进程退出。
-onQuit('remote-ssh-pool', () => disposeRemoteSshPool(), 'async');
+// post-async(非 async):shutdown-maker 在 async 阶段关 sessions 时, PiAgent.close()
+// 会经 pi-manager RPC 发 kill 杀远端 daemon —— 若 pool 在 async 并发先
+// 断开 SSH, kill 失败, daemon + env-file(含凭证)残留 30 分钟(R6 审计 M-8/M-11)。
+// 挪到 post-async 串行, 保证 session 级 kill 先完成, pool 最后收尾。
+onQuit('remote-ssh-pool', () => disposeRemoteSshPool(), 'post-async');
 // WDA deleteSession may consume longer than the shared async quit budget. Kill
 // detached WDA/Sidecar process groups synchronously before that budget starts;
 // the lightweight seam is a no-op when Simulator was never initialized.
@@ -7379,6 +7424,65 @@ function subagentModelSettingsWire() {
     customizedKeys: state.customizedKeys,
     defaults: state.defaults,
   };
+}
+
+function visionBridgeSettingsWire() {
+  const state = readVisionBridgeSettingsState();
+  return {
+    ...state.value,
+    isCustomized: state.isCustomized,
+    customizedKeys: state.customizedKeys,
+    defaults: state.defaults,
+  };
+}
+
+/** 解析视觉桥设置 patch（白名单键，逐字段校验；非法抛 INVALID_PARAMS）。 */
+function parseVisionBridgeSettingsPatch(raw: unknown): Partial<VisionBridgeSettings> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throwIpcError('INVALID_PARAMS', 'vision bridge settings patch required (object)');
+  }
+  const input = raw as Record<string, unknown>;
+  const patch: Partial<VisionBridgeSettings> = {};
+  if ('enabled' in input) {
+    if (typeof input.enabled !== 'boolean') {
+      throwIpcError('INVALID_PARAMS', 'vision bridge enabled must be boolean');
+    }
+    patch.enabled = input.enabled;
+  }
+  if ('targetModels' in input) {
+    if (!Array.isArray(input.targetModels)) {
+      throwIpcError('INVALID_PARAMS', 'vision bridge targetModels must be a string array');
+    }
+    // trim 后拒绝空白元素，避免脏值（" deepseek " / "  "）落盘。
+    const trimmed = input.targetModels.map((m) => (typeof m === 'string' ? m.trim() : ''));
+    if (trimmed.some((m) => m.length === 0)) {
+      throwIpcError('INVALID_PARAMS', 'vision bridge targetModels must be a non-blank string array');
+    }
+    patch.targetModels = trimmed;
+  }
+  for (const key of ['primary', 'fallback'] as const) {
+    if (!(key in input)) continue;
+    const value = input[key];
+    if (value === null) {
+      patch[key] = null;
+      continue;
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throwIpcError('INVALID_PARAMS', `vision bridge ${key} must be { providerId, modelId } or null`);
+    }
+    const ref = value as Record<string, unknown>;
+    if (typeof ref.providerId !== 'string' || typeof ref.modelId !== 'string') {
+      throwIpcError('INVALID_PARAMS', `vision bridge ${key} must be { providerId, modelId } or null`);
+    }
+    // trim 后拒绝纯空白，避免脏配置（空白串）落盘。
+    const providerId = ref.providerId.trim();
+    const modelId = ref.modelId.trim();
+    if (providerId.length === 0 || modelId.length === 0) {
+      throwIpcError('INVALID_PARAMS', `vision bridge ${key} providerId/modelId must not be blank`);
+    }
+    patch[key] = { providerId, modelId };
+  }
+  return patch;
 }
 
 function parseSubagentModelSettingsPatch(raw: unknown): SubagentModelSettingsPatch {

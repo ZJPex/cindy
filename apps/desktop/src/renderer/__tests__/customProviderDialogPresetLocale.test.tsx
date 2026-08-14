@@ -198,7 +198,14 @@ describe('CustomProviderDialog preset locale ownership', () => {
       name: 'settings.providers.custom.presets.label',
     });
     fireEvent.click(trigger);
-    expect(await screen.findByRole('option', { name: '繁體供應商' })).not.toBeNull();
+    const option = await screen.findByRole('option', { name: '繁體供應商' });
+    // 等 layout effect 把 childLayer 写进 childLayerRef。只等 option 出现不够:
+    // Windows CI 上 rAF 也可能早于 useLayoutEffect, 第一个 pointerDown 会关整表。
+    await waitFor(() => {
+      expect(option.isConnected).toBe(true);
+    });
+    await new Promise<void>((resolve) => { requestAnimationFrame(() => resolve()); });
+    await new Promise<void>((resolve) => { requestAnimationFrame(() => resolve()); });
 
     const scrim = overlayOf(
       screen.getByRole('dialog', { name: 'settings.providers.custom.dialog.createTitle' }),
@@ -206,14 +213,14 @@ describe('CustomProviderDialog preset locale ownership', () => {
     const staleLayerListener = vi.fn();
     document.addEventListener('pointerdown', staleLayerListener, true);
     try {
-      pointerDownOn(scrim);
+      act(() => pointerDownOn(scrim));
       await waitFor(() => {
         expect(screen.queryByRole('option', { name: '繁體供應商' })).toBeNull();
       });
       expect(staleLayerListener).not.toHaveBeenCalled();
       expect(onClose).not.toHaveBeenCalled();
 
-      pointerDownOn(scrim);
+      act(() => pointerDownOn(scrim));
       await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
       expect(staleLayerListener).not.toHaveBeenCalled();
     } finally {
@@ -261,6 +268,7 @@ describe('CustomProviderDialog preset locale ownership', () => {
     });
     fireEvent.click(trigger);
     expect(await screen.findByRole('option', { name: '繁體供應商' })).not.toBeNull();
+    await new Promise<void>((resolve) => { requestAnimationFrame(() => resolve()); });
 
     dispatchEscape(document, eventInit);
     expect(screen.getByRole('option', { name: '繁體供應商' })).not.toBeNull();
