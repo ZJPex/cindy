@@ -1,14 +1,9 @@
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { promises as fsp, type Dirent } from 'node:fs';
+import { promises as fsp } from 'node:fs';
 
-import {
-  GHOST_INSTALL_MANIFEST_MAX_BYTES,
-  GHOST_MANIFEST_FILE,
-  GHOST_SKILL_MD_MAX_BYTES,
-  validateGhostManifest,
-} from '../../shared/ghost.js';
+import { GHOST_SKILL_MD_MAX_BYTES, type InstalledGhost } from '../../shared/ghost.js';
 
 import { checkSkillMdConsistency } from '../cindy-brain/skillSlot.js';
 import { readBoundedFileNoFollow } from '../utils/readBoundedFile.js';
@@ -45,40 +40,26 @@ export interface CodexGlobalSkillsPrepareResult {
   warnings: string[];
 }
 
-interface PrepareOptions {
+export interface CodexApprovedGhostSkillSource {
+  ghosts: readonly InstalledGhost[];
+  validateApprovedSkillSnapshot: (ghost: InstalledGhost) => Promise<boolean>;
+}
+
+interface OwnerGhostOptions {
   homeDir?: string;
   /** 当前登录 owner 的私有数据根；缺省时对 Ghost Skill 采取 fail-closed。 */
   ownerRoot?: string;
+  /** 仅接受 GhostManager 从 receipt 投影出的批准快照，不读取可变安装目录。 */
+  approvedGhostSkills?: CodexApprovedGhostSkillSource;
+  /** owner 可能在异步文件操作期间切换；每个发布边界前都必须重新核对。 */
+  assertOwnerStable?: () => void;
 }
+
+type PrepareOptions = OwnerGhostOptions;
 
 interface ProjectionEntry {
   name: string;
   target: string;
-}
-
-const GHOST_DISABLED_MARKER_FILE = '.disabled';
-
-async function pathExists(pathname: string): Promise<boolean> {
-  try {
-    await fsp.access(pathname);
-    return true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
-    throw err;
-  }
-}
-
-async function runtimeRepositoryRootForOwner(ownerRoot?: string): Promise<string | null> {
-  if (!ownerRoot) return null;
-  const activeRepositoryRoot = path.join(ownerRoot, 'cindy-brain');
-  try {
-    if (await pathExists(activeRepositoryRoot)) return activeRepositoryRoot;
-    const legacyRepositoryRoot = path.join(ownerRoot, 'brain');
-    return (await pathExists(legacyRepositoryRoot)) ? legacyRepositoryRoot : null;
-  } catch {
-    // 无法确定运行时仓库根时不能放行任何 Ghost Skill。
-    return null;
-  }
 }
 
 function ghostIdFromLinkName(linkName: string | undefined): string | null {
@@ -91,13 +72,24 @@ function targetLooksGhostRepositoryManaged(target: string, linkName?: string): b
   const segments = target.split(/[\\/]/).map((segment) => segment.toLowerCase());
   const expectedGhostId = ghostIdFromLinkName(linkName);
   return segments.some((segment, index) => {
-    if (segment !== 'cindy-brain' && segment !== 'brain') return false;
-    // 仅目录名相同不能证明是 Cindy 插件安装根：普通用户 Skill 完全可能位于
-    // /work/brain/<name>/...。插件安装根必须属于 owner 命名空间，避免把这类
-    // 全局 Skill 误投影为 Ghost 后对所有 Profile 禁用。
+    // 旧安装目录只用于识别并隔离遗留链接，绝不再作为允许列表来源。
+    if (segment === 'cindy-brain' || segment === 'brain') {
+      if (segments[index - 2] !== 'owners' || !segments[index - 1]) return false;
+      const actualGhostId = segments[index + 1];
+      return Boolean(actualGhostId) && (!expectedGhostId || actualGhostId === expectedGhostId);
+    }
+    // 当前受管链接指向 receipt-backed 批准快照：
+    // owners/<owner>/ghost-install-state/skill-snapshots/<id>/<revision>/...
+    if (segment !== 'ghost-install-state') return false;
     if (segments[index - 2] !== 'owners' || !segments[index - 1]) return false;
-    const actualGhostId = segments[index + 1];
-    return Boolean(actualGhostId) && (!expectedGhostId || actualGhostId === expectedGhostId);
+    if (segments[index + 1] !== 'skill-snapshots') return false;
+    const actualGhostId = segments[index + 2];
+    const revision = segments[index + 3];
+    return (
+      Boolean(actualGhostId) &&
+      Boolean(revision) &&
+      (!expectedGhostId || actualGhostId === expectedGhostId)
+    );
   });
 }
 
@@ -145,46 +137,45 @@ async function lexicalManagedLinkTarget(
   }
 }
 
-async function collectOwnerInstalledGhostSkills(ownerRoot?: string): Promise<ProjectionEntry[]> {
+async function collectOwnerApprovedGhostSkills(
+  opts: OwnerGhostOptions,
+): Promise<ProjectionEntry[]> {
   const entries = new Map<string, ProjectionEntry>();
-  // 与 Ghost 运行时的迁移结果保持一致：新旧目录并存时只认新目录；只有旧目录时
-  // 继续兼容迁移失败后的 legacy 根，不能把两个安装清单合并成一个可见集合。
-  const repositoryRoot = await runtimeRepositoryRootForOwner(ownerRoot);
-  if (!repositoryRoot) return [];
-  const repositoryRootReal = await fsp.realpath(repositoryRoot).catch(() => null);
-  if (!repositoryRootReal) return [];
-  const repositoryRootCompare = normalizeForCompare(repositoryRootReal);
-  let ghostDirs: Dirent[];
-  try {
-    ghostDirs = await fsp.readdir(repositoryRoot, { withFileTypes: true });
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    throw err;
-  }
+  const source = opts.approvedGhostSkills;
+  if (!opts.ownerRoot || !source) return [];
+  opts.assertOwnerStable?.();
+  const ownerRootReal = await fsp.realpath(opts.ownerRoot).catch(() => null);
+  opts.assertOwnerStable?.();
+  if (!ownerRootReal) return [];
+  const ownerRootCompare = normalizeForCompare(ownerRootReal);
 
-  for (const ghostEntry of ghostDirs.sort((a, b) => a.name.localeCompare(b.name))) {
-    if (!ghostEntry.isDirectory() || ghostEntry.name.startsWith('.')) continue;
-    const ghostDir = path.join(repositoryRoot, ghostEntry.name);
-    const manifestPath = path.join(ghostDir, GHOST_MANIFEST_FILE);
+  const ghosts = [...source.ghosts].sort((a, b) => a.manifest.id.localeCompare(b.manifest.id));
+  for (const ghost of ghosts) {
+    if (
+      !ghost.enabled ||
+      ghost.approval.state !== 'approved' ||
+      !ghost.approvedSkillRoot ||
+      !ghost.manifest.slots.includes('skill') ||
+      !ghost.manifest.skill
+    ) {
+      continue;
+    }
     try {
-      if (await pathExists(path.join(ghostDir, GHOST_DISABLED_MARKER_FILE))) continue;
-      const manifestBytes = await readBoundedFileNoFollow(
-        manifestPath,
-        GHOST_INSTALL_MANIFEST_MAX_BYTES,
-        { containWithin: repositoryRootReal },
-      );
-      if (!manifestBytes) continue;
-      const validation = validateGhostManifest(JSON.parse(manifestBytes.toString('utf8')));
-      if (!validation.ok || validation.manifest.id !== ghostEntry.name) continue;
-      const manifest = validation.manifest;
-      if (!manifest.slots.includes('skill') || !manifest.skill) continue;
+      opts.assertOwnerStable?.();
+      if (!(await source.validateApprovedSkillSnapshot(ghost))) continue;
+      opts.assertOwnerStable?.();
 
-      for (const item of manifest.skill.items) {
-        const targetPath = path.join(ghostDir, ...item.dir.split('/'));
+      const snapshotRoot = await fsp.realpath(ghost.approvedSkillRoot).catch(() => null);
+      if (!snapshotRoot || !isSameOrInside(normalizeForCompare(snapshotRoot), ownerRootCompare)) {
+        continue;
+      }
+      const snapshotRootCompare = normalizeForCompare(snapshotRoot);
+      for (const item of ghost.manifest.skill.items) {
+        const targetPath = path.join(ghost.approvedSkillRoot, ...item.dir.split('/'));
         const target = await realPathOrNull(targetPath);
         if (
           !target ||
-          !isSameOrInside(target, repositoryRootCompare) ||
+          !isSameOrInside(target, snapshotRootCompare) ||
           !(await isDirectory(targetPath))
         ) {
           continue;
@@ -192,16 +183,17 @@ async function collectOwnerInstalledGhostSkills(ownerRoot?: string): Promise<Pro
         const skillMdBytes = await readBoundedFileNoFollow(
           path.join(targetPath, 'SKILL.md'),
           GHOST_SKILL_MD_MAX_BYTES,
-          { containWithin: repositoryRootReal },
+          { containWithin: snapshotRoot },
         );
         if (!skillMdBytes || checkSkillMdConsistency(skillMdBytes.toString('utf8'), item)) {
           continue;
         }
-        const name = `${manifest.id}--${item.name}`;
+        const name = `${ghost.manifest.id}--${item.name}`;
         if (!entries.has(name)) entries.set(name, { name, target });
       }
     } catch {
-      // A damaged installed Ghost must not make the projection fail open.
+      // 批准快照缺失、校验失败或 owner 切换都不能退回可变安装目录。
+      opts.assertOwnerStable?.();
       continue;
     }
   }
@@ -215,12 +207,14 @@ async function collectOwnerInstalledGhostSkills(ownerRoot?: string): Promise<Pro
  */
 export async function codexDisabledSkillPathsForOwner(
   skills: ReadonlyArray<{ path: string }>,
-  ownerRoot?: string,
+  opts: OwnerGhostOptions = {},
 ): Promise<string[]> {
+  opts.assertOwnerStable?.();
   const allowedByLinkName = new Map<string, string>();
   const allowedTargets = new Set<string>();
-  for (const entry of await collectOwnerInstalledGhostSkills(ownerRoot)) {
+  for (const entry of await collectOwnerApprovedGhostSkills(opts)) {
     const skillMdTarget = await realPathOrNull(path.join(entry.target, 'SKILL.md'));
+    opts.assertOwnerStable?.();
     if (!skillMdTarget) continue;
     allowedByLinkName.set(entry.name, skillMdTarget);
     allowedTargets.add(skillMdTarget);
@@ -228,9 +222,11 @@ export async function codexDisabledSkillPathsForOwner(
   const disabled: string[] = [];
 
   for (const skill of skills) {
+    opts.assertOwnerStable?.();
     const target = (await realPathOrNull(skill.path)) ?? normalizeForCompare(skill.path);
     const linkName = managedLinkNameFromSkillPath(skill.path);
     const lexicalTarget = await lexicalManagedLinkTarget(skill.path, linkName);
+    opts.assertOwnerStable?.();
     if (
       !targetLooksGhostRepositoryManaged(target, linkName) &&
       !(lexicalTarget && targetLooksGhostRepositoryManaged(lexicalTarget, linkName))
@@ -242,6 +238,7 @@ export async function codexDisabledSkillPathsForOwner(
       disabled.push(skill.path);
     }
   }
+  opts.assertOwnerStable?.();
   return disabled.sort();
 }
 
@@ -251,7 +248,7 @@ export async function codexDisabledSkillPathsForOwner(
  */
 async function collectOwnerVisibleAgentSkills(
   sharedSkillsDir: string,
-  ownerRoot?: string,
+  opts: OwnerGhostOptions,
 ): Promise<ProjectionEntry[]> {
   const entries = await fsp.readdir(sharedSkillsDir, { withFileTypes: true });
   const visible = new Map<string, ProjectionEntry>();
@@ -274,7 +271,7 @@ async function collectOwnerVisibleAgentSkills(
     visible.set(entry.name, { name: entry.name, target });
   }
 
-  for (const ownerEntry of await collectOwnerInstalledGhostSkills(ownerRoot)) {
+  for (const ownerEntry of await collectOwnerApprovedGhostSkills(opts)) {
     // 共享根里的受管 Ghost 已在上方统一跳过；若仍有同名条目，它就是不应覆盖的
     // 普通用户目录或外来链接，继续遵守 skillSlot 的 no-clobber 规则。
     if (!visible.has(ownerEntry.name)) visible.set(ownerEntry.name, ownerEntry);
@@ -293,24 +290,28 @@ function projectionSignature(entries: ProjectionEntry[]): string {
 async function ensureAgentsProjection(
   codexHome: string,
   sharedSkillsDir: string,
-  ownerRoot?: string,
+  opts: OwnerGhostOptions,
 ): Promise<string> {
-  const entries = await collectOwnerVisibleAgentSkills(sharedSkillsDir, ownerRoot);
+  const entries = await collectOwnerVisibleAgentSkills(sharedSkillsDir, opts);
   const projectionRoot = path.join(codexHome, 'skill-projections');
   const projectionDir = path.join(projectionRoot, `agents-${projectionSignature(entries)}`);
   if (await isDirectory(projectionDir)) return projectionDir;
 
   // 内容寻址目录 + 临时目录 rename，避免 Codex 扫到只建了一半的投影。
+  opts.assertOwnerStable?.();
   await fsp.mkdir(projectionRoot, { recursive: true });
+  opts.assertOwnerStable?.();
   const stagingDir = await fsp.mkdtemp(path.join(projectionRoot, '.agents-'));
   try {
     for (const entry of entries) {
+      opts.assertOwnerStable?.();
       const result = await ensureDirectoryLink(path.join(stagingDir, entry.name), entry.target);
       if (result.status !== 'linked' && result.status !== 'kept') {
         throw new Error(`cannot project ${entry.name}: ${result.reason ?? result.status}`);
       }
     }
     try {
+      opts.assertOwnerStable?.();
       await fsp.rename(stagingDir, projectionDir);
     } catch (err) {
       if (!(await isDirectory(projectionDir))) throw err;
@@ -321,7 +322,11 @@ async function ensureAgentsProjection(
   return projectionDir;
 }
 
-async function cleanupStaleAgentsProjections(codexHome: string, currentDir: string): Promise<void> {
+async function cleanupStaleAgentsProjections(
+  codexHome: string,
+  currentDir: string,
+  assertOwnerStable?: () => void,
+): Promise<void> {
   const projectionRoot = path.join(codexHome, 'skill-projections');
   let entries: string[];
   try {
@@ -337,6 +342,7 @@ async function cleanupStaleAgentsProjections(codexHome: string, currentDir: stri
     const entryPath = path.join(projectionRoot, entry);
     const stat = await fsp.lstat(entryPath).catch(() => null);
     if (stat?.isDirectory() && !stat.isSymbolicLink()) {
+      assertOwnerStable?.();
       await fsp.rm(entryPath, { recursive: true, force: true });
     }
   }
@@ -389,6 +395,7 @@ export async function prepareCodexGlobalSkillsLinks(
   codexHome: string,
   opts: PrepareOptions = {},
 ): Promise<CodexGlobalSkillsPrepareResult> {
+  opts.assertOwnerStable?.();
   const paths = codexGlobalSkillsPaths(codexHome, opts.homeDir);
   await fsp.mkdir(paths.codexHome, { recursive: true });
   await fsp.mkdir(paths.skillsDir, { recursive: true });
@@ -406,6 +413,7 @@ export async function prepareCodexGlobalSkillsLinks(
   const sources: CodexGlobalSkillSourceResult[] = [];
   for (const sourceDef of sourceDefs) {
     if (!(await isDirectory(sourceDef.source))) {
+      opts.assertOwnerStable?.();
       changed = (await removeManagedLink(sourceDef.link)) || changed;
       sources.push({ ...sourceDef, status: 'missing', reason: 'source directory does not exist' });
       continue;
@@ -420,12 +428,9 @@ export async function prepareCodexGlobalSkillsLinks(
     let linkTarget = sourceDef.source;
     if (sourceDef.name === 'agents') {
       try {
-        linkTarget = await ensureAgentsProjection(
-          paths.codexHome,
-          sourceDef.source,
-          opts.ownerRoot,
-        );
+        linkTarget = await ensureAgentsProjection(paths.codexHome, sourceDef.source, opts);
       } catch (err) {
+        opts.assertOwnerStable?.();
         changed = (await removeManagedLink(sourceDef.link)) || changed;
         const reason = `cannot build owner-filtered projection: ${(err as Error).message}`;
         sources.push({ ...sourceDef, status: 'error', reason });
@@ -434,6 +439,7 @@ export async function prepareCodexGlobalSkillsLinks(
       }
     }
 
+    opts.assertOwnerStable?.();
     const result = await ensureDirectoryLink(sourceDef.link, linkTarget);
     changed = changed || result.changed;
     sources.push({ ...sourceDef, status: result.status, reason: result.reason });
@@ -443,7 +449,12 @@ export async function prepareCodexGlobalSkillsLinks(
       );
     }
     if (sourceDef.name === 'agents' && (result.status === 'linked' || result.status === 'kept')) {
-      await cleanupStaleAgentsProjections(paths.codexHome, linkTarget).catch((err: Error) => {
+      await cleanupStaleAgentsProjections(
+        paths.codexHome,
+        linkTarget,
+        opts.assertOwnerStable,
+      ).catch((err: Error) => {
+        opts.assertOwnerStable?.();
         warnings.push(`cannot clean stale Codex agents projections: ${err.message}`);
       });
     }

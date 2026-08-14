@@ -1,7 +1,9 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const harness = vi.hoisted(() => ({
+  ownerId: 'owner-a',
   ownerScopeKey: 'cloud:owner-a:1',
+  ownerGeneration: 1,
   ownerRoot: '/data/owners/owner-a',
   userDataDir: '/tmp/cindy-codex-assets-owner-scope',
   homeDir: '/home/test-user',
@@ -32,12 +34,23 @@ vi.mock('node:os', async () => {
 
 vi.mock('../../appSessionState.js', () => ({
   activeOwnerScopeKey: () => harness.ownerScopeKey,
-  getActiveAppSession: () => ({ mode: 'cloud', dataOwnerId: harness.ownerScopeKey }),
+  getActiveAppSession: () => ({
+    mode: 'cloud',
+    dataOwnerId: harness.ownerId,
+    generation: harness.ownerGeneration,
+  }),
   isAppSessionBoundaryPending: () => false,
   ownerScopedUserDataPath: () => harness.ownerRoot,
 }));
 
 describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
+  beforeEach(() => {
+    harness.ownerId = 'owner-a';
+    harness.ownerScopeKey = 'cloud:owner-a:1';
+    harness.ownerGeneration = 1;
+    harness.ownerRoot = '/data/owners/owner-a';
+  });
+
   it(
     'coalesces one owner but queues a new preparation after an owner switch',
     { timeout: 30_000 },
@@ -55,7 +68,13 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
         finishOwnerB = resolve;
       });
       const runEnsureGlobalCodexAssets = vi
-        .fn<(ownerRoot: string) => Promise<{ skillsProjectionEpoch: number }>>()
+        .fn<
+          (owner: {
+            ownerId: string | null;
+            ownerRoot: string;
+            ownerScopeKey: string;
+          }) => Promise<{ skillsProjectionEpoch: number }>
+        >()
         .mockImplementationOnce(async () => {
           await ownerARun;
           return { skillsProjectionEpoch: 0 };
@@ -81,9 +100,15 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
       const firstOwnerA = adapter.ensureGlobalCodexAssets();
       const secondOwnerA = adapter.ensureGlobalCodexAssets();
       expect(runEnsureGlobalCodexAssets).toHaveBeenCalledTimes(1);
-      expect(runEnsureGlobalCodexAssets).toHaveBeenLastCalledWith('/data/owners/owner-a');
+      expect(runEnsureGlobalCodexAssets).toHaveBeenLastCalledWith({
+        ownerId: 'owner-a',
+        ownerRoot: '/data/owners/owner-a',
+        ownerScopeKey: 'cloud:owner-a:1',
+      });
 
+      harness.ownerId = 'owner-b';
       harness.ownerScopeKey = 'cloud:owner-b:2';
+      harness.ownerGeneration = 2;
       harness.ownerRoot = '/data/owners/owner-b';
       const ownerB = adapter.ensureGlobalCodexAssets();
       expect(runEnsureGlobalCodexAssets).toHaveBeenCalledTimes(1);
@@ -91,12 +116,46 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
       finishOwnerA();
       await Promise.all([firstOwnerA, secondOwnerA]);
       await vi.waitFor(() => expect(runEnsureGlobalCodexAssets).toHaveBeenCalledTimes(2));
-      expect(runEnsureGlobalCodexAssets).toHaveBeenLastCalledWith('/data/owners/owner-b');
+      expect(runEnsureGlobalCodexAssets).toHaveBeenLastCalledWith({
+        ownerId: 'owner-b',
+        ownerRoot: '/data/owners/owner-b',
+        ownerScopeKey: 'cloud:owner-b:2',
+      });
 
       finishOwnerB();
       await expect(ownerB).resolves.toEqual({ skillsProjectionEpoch: 0 });
     },
   );
+
+  it('rejects a queued owner capture after a later Profile becomes active', async () => {
+    const { DesktopCodexAuthAdapter } = await import('../auth-adapters.js');
+    const adapter = Object.create(DesktopCodexAuthAdapter.prototype) as InstanceType<
+      typeof DesktopCodexAuthAdapter
+    >;
+    const runEnsureGlobalCodexAssets = (
+      DesktopCodexAuthAdapter.prototype as unknown as {
+        runEnsureGlobalCodexAssets(owner: {
+          ownerId: string;
+          ownerRoot: string;
+          ownerScopeKey: string;
+        }): Promise<{ skillsProjectionEpoch: number }>;
+      }
+    ).runEnsureGlobalCodexAssets;
+
+    const queuedOwnerB = {
+      ownerId: 'owner-b',
+      ownerRoot: '/data/owners/owner-b',
+      ownerScopeKey: 'cloud:owner-b:2',
+    };
+    harness.ownerId = 'owner-c';
+    harness.ownerScopeKey = 'cloud:owner-c:3';
+    harness.ownerGeneration = 3;
+    harness.ownerRoot = '/data/owners/owner-c';
+
+    await expect(runEnsureGlobalCodexAssets.call(adapter, queuedOwnerB)).rejects.toThrow(
+      'owner changed before projection publish',
+    );
+  });
 
   it('keeps per-cwd skills/list dirty sticky across projection epochs', async () => {
     const { DesktopCodexAuthAdapter } = await import('../auth-adapters.js');
@@ -111,7 +170,11 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
         reloadedEpoch: number,
       ) => void;
       codexSkillsListCacheKey: (workingDir?: string | null) => string;
-      runEnsureGlobalCodexAssets: (ownerRoot: string) => Promise<{ skillsProjectionEpoch: number }>;
+      runEnsureGlobalCodexAssets: (owner: {
+        ownerId: string | null;
+        ownerRoot: string;
+        ownerScopeKey: string;
+      }) => Promise<{ skillsProjectionEpoch: number }>;
     };
     Object.defineProperties(adapter, {
       pendingAssetsPrep: { configurable: true, writable: true, value: null },

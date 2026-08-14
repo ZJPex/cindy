@@ -31,7 +31,10 @@ import type {
 } from '@cindy/maker-core';
 import { getCachedBinaryStatus, isVettedAgentBinaryPath } from '../agent-binaries/index.js';
 import { createLogger } from '../logger.js';
-import { prepareCodexGlobalSkillsLinks } from './codex-global-skills.js';
+import {
+  prepareCodexGlobalSkillsLinks,
+  type CodexApprovedGhostSkillSource,
+} from './codex-global-skills.js';
 import { prepareCodexGlobalRulesCopy } from './codex-global-rules.js';
 import { prepareCodexGlobalPluginsBridge } from './codex-global-plugins.js';
 import { DESKTOP_CAPABILITY_ROUTING_POLICY } from './capability-routing.js';
@@ -697,6 +700,29 @@ type CodexDisconnectIntent = {
   acceptingIntent: boolean;
 };
 
+interface CodexAssetPrepOwnerCapture {
+  ownerId: string | null;
+  ownerRoot: string;
+  ownerScopeKey: string;
+}
+
+function captureCodexAssetPrepOwner(): CodexAssetPrepOwnerCapture {
+  // 三次读取之间没有 await；同一 JS turn 内把 ID、scope 与 root 固定成一个入队快照。
+  const ownerId = getActiveAppSession().dataOwnerId;
+  return {
+    ownerId,
+    ownerRoot: ownerScopedUserDataPath(),
+    ownerScopeKey: activeOwnerScopeKey(),
+  };
+}
+
+function assertCodexAssetPrepOwnerStable(capture: CodexAssetPrepOwnerCapture): void {
+  if (activeOwnerScopeKey() !== capture.ownerScopeKey) {
+    throw new Error('Codex asset preparation owner changed before projection publish');
+  }
+  assertGhostSkillProjectionBoundaryStableForOwner(capture.ownerId);
+}
+
 const MAX_COALESCED_LOGIN_PROGRESS_CHARS = 64 * 1024;
 
 export class DesktopCodexAuthAdapter implements AuthAdapter {
@@ -765,9 +791,11 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
    * 因为源文件 (~/.codex/AGENTS.md) 随时可能被用户修改。
    */
   private pendingAssetsPrep: {
-    ownerScopeKey: string;
+    owner: CodexAssetPrepOwnerCapture;
     promise: Promise<{ skillsProjectionEpoch: number }>;
   } | null = null;
+  /** 由 maker-host 装配 GhostManager 的批准态唯一入口；未装配时 Ghost 投影 fail-closed。 */
+  private approvedGhostSkillSourceProvider?: () => CodexApprovedGhostSkillSource;
 
   /**
    * owner 投影重建代次。app-server 的 `skills/list` 按 cwd 缓存，因此不能用单个全局
@@ -1069,18 +1097,17 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
   }
 
   async ensureGlobalCodexAssets(): Promise<{ skillsProjectionEpoch: number }> {
-    const ownerScopeKey = activeOwnerScopeKey();
-    const ownerRoot = ownerScopedUserDataPath();
+    const owner = captureCodexAssetPrepOwner();
     const current = this.pendingAssetsPrep;
-    if (current?.ownerScopeKey === ownerScopeKey) return current.promise;
+    if (current?.owner.ownerScopeKey === owner.ownerScopeKey) return current.promise;
 
     const start = current
-      ? current.promise.catch(() => undefined).then(() => this.runEnsureGlobalCodexAssets(ownerRoot))
-      : this.runEnsureGlobalCodexAssets(ownerRoot);
+      ? current.promise.catch(() => undefined).then(() => this.runEnsureGlobalCodexAssets(owner))
+      : this.runEnsureGlobalCodexAssets(owner);
     const pending: {
-      ownerScopeKey: string;
+      owner: CodexAssetPrepOwnerCapture;
       promise: Promise<{ skillsProjectionEpoch: number }>;
-    } = { ownerScopeKey, promise: start };
+    } = { owner, promise: start };
     pending.promise = start.finally(() => {
       if (this.pendingAssetsPrep === pending) this.pendingAssetsPrep = null;
     });
@@ -1119,24 +1146,30 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
   }
 
   private async runEnsureGlobalCodexAssets(
-    ownerRoot: string,
+    owner: CodexAssetPrepOwnerCapture,
   ): Promise<{ skillsProjectionEpoch: number }> {
     // Load-bearing order: Codex skill linking scans ~/.agents/skills, so shared
     // links must populate that directory before prepareCodexGlobalSkillsLinks runs.
-    const ownerId = getActiveAppSession().dataOwnerId;
-    const sharedOutcome = await withSharedGlobalSkillProjectionMutation(ownerId, () =>
+    const assertOwnerStable = () => assertCodexAssetPrepOwnerStable(owner);
+    assertOwnerStable();
+    const sharedOutcome = await withSharedGlobalSkillProjectionMutation(owner.ownerId, () =>
       prepareSharedGlobalSkillLinks({
-        assertOwnerStable: () =>
-          assertGhostSkillProjectionBoundaryStableForOwner(ownerId),
+        assertOwnerStable,
       }),
     ).then(
       (r) => ({ ok: true as const, label: 'shared-skills' as const, warnings: r.warnings }),
       (err: Error) => ({ ok: false as const, label: 'shared-skills' as const, err }),
     );
+    // shared 对账可能因 owner 切换而失败；不能把这类失败折成 warning 后继续发布旧 root。
+    assertOwnerStable();
+    const approvedGhostSkills = this.approvedGhostSkillSourceProvider?.();
+    assertOwnerStable();
 
     const [skillsOutcome, rulesOutcome, pluginsOutcome] = await Promise.all([
       prepareCodexGlobalSkillsLinks(this.codexHome, {
-        ownerRoot,
+        ownerRoot: owner.ownerRoot,
+        ...(approvedGhostSkills ? { approvedGhostSkills } : {}),
+        assertOwnerStable,
       }).then(
         (r) => ({
           ok: true as const,
@@ -1162,6 +1195,7 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
         (err: Error) => ({ ok: false as const, label: 'plugins' as const, err }),
       ),
     ]);
+    assertOwnerStable();
 
     for (const outcome of [sharedOutcome, skillsOutcome, rulesOutcome, pluginsOutcome]) {
       if (!outcome.ok) {
@@ -1224,6 +1258,13 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
    */
   setOnOAuthBindingClaimed(cb: () => void | Promise<void>): void {
     this.onOAuthBindingClaimed = cb;
+  }
+
+  /** 注入 GhostManager 的 receipt-backed 技能来源，避免 auth adapter 反向依赖插件模块。 */
+  setApprovedGhostSkillSourceProvider(
+    provider: (() => CodexApprovedGhostSkillSource) | undefined,
+  ): void {
+    this.approvedGhostSkillSourceProvider = provider;
   }
 
   async getState(options?: AuthAdapterOptions): Promise<AuthState> {

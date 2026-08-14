@@ -49,8 +49,14 @@ import { tapWindowBroadcast } from '../device-link/broadcast-tap.js';
 import { remoteInvoke } from '../device-link/index.js';
 import { WorktreePool } from '../worktree/index.js';
 import { getReadyBinaryPath, getCachedBinaryStatus } from '../agent-binaries/index.js';
-import { activeOwnerScopeKey, isAppSessionBoundaryPending, ownerScopedUserDataPath } from '../appSessionState.js';
-import { getIOSSimulatorPluginAccessDecision } from '../cindy-brain/index.js';
+import {
+  activeOwnerScopeKey,
+  getActiveAppSession,
+  isAppSessionBoundaryPending,
+  ownerScopedUserDataPath,
+} from '../appSessionState.js';
+import { getGhostManager, getIOSSimulatorPluginAccessDecision } from '../cindy-brain/index.js';
+import { assertGhostSkillProjectionBoundaryStableForOwner } from '../authBoundaryQuarantine.js';
 import {
   desktopClaudeAuthAdapter,
   desktopCodexAuthAdapter,
@@ -1192,8 +1198,29 @@ export function getMaker(): Maker {
           remoteHostId,
         });
       },
-      resolveCodexDisabledSkillPaths: ({ skills }) =>
-        codexDisabledSkillPathsForOwner(skills, ownerScopedUserDataPath()),
+      resolveCodexDisabledSkillPaths: ({ skills }) => {
+        // list/verify 跨 await，必须把同一 owner 的 ID/scope/root 一起固定下来。
+        const ownerId = getActiveAppSession().dataOwnerId;
+        const ownerScopeKey = activeOwnerScopeKey();
+        const ownerRoot = ownerScopedUserDataPath();
+        const assertOwnerStable = () => {
+          if (activeOwnerScopeKey() !== ownerScopeKey) {
+            throw new Error('Codex skill filtering owner changed during approved snapshot read');
+          }
+          assertGhostSkillProjectionBoundaryStableForOwner(ownerId);
+        };
+        assertOwnerStable();
+        const ghostManager = getGhostManager();
+        return codexDisabledSkillPathsForOwner(skills, {
+          ownerRoot,
+          approvedGhostSkills: {
+            ghosts: ghostManager.list(),
+            validateApprovedSkillSnapshot: (ghost) =>
+              ghostManager.verifyApprovedSkillSnapshot(ghost),
+          },
+          assertOwnerStable,
+        });
+      },
       makerMemory: makerMemoryManager,
       codexHostDynamicToolProvider: createIOSSimulatorCodexDynamicToolProvider({
         deps: getIOSSimulatorMcpDeps({ resolveAccess: resolveIOSSimulatorAccess }),
@@ -1607,6 +1634,13 @@ export function getMaker(): Maker {
     // DesktopCodexAuthAdapter 构造函数里(import 即写盘),会让所有传递性 import 到
     // auth-adapters 的测试在真实文件系统留痕(2026-07-03 曾把含真实凭证硬链的
     // codex-home 生成进仓库),现改为装配 maker 时显式预热,import 保持零副作用。
+    desktopCodexAuthAdapter.setApprovedGhostSkillSourceProvider(() => {
+      const ghostManager = getGhostManager();
+      return {
+        ghosts: ghostManager.list(),
+        validateApprovedSkillSnapshot: (ghost) => ghostManager.verifyApprovedSkillSnapshot(ghost),
+      };
+    });
     desktopCodexAuthAdapter.warmUp();
     setCodexGlobalSkillsRefreshHandler(async () => {
       await desktopCodexAuthAdapter.ensureGlobalCodexAssets();
