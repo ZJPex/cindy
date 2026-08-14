@@ -57,6 +57,20 @@ function renderDialog(onClose = vi.fn()) {
   };
 }
 
+async function findReadyPresetTrigger() {
+  const trigger = await screen.findByRole('button', {
+    name: 'settings.providers.custom.presets.label',
+  });
+  // 对话框挂载后会在 rAF 中移动焦点。在焦点稳定前打开 Radix Popover，
+  // 菜单可能立即关闭，并让测试继续使用已经失效的节点。
+  await waitFor(() => {
+    expect(document.activeElement).toBe(
+      screen.getByPlaceholderText('settings.providers.custom.fields.namePlaceholder'),
+    );
+  });
+  return trigger;
+}
+
 // jsdom 的 KeyboardEvent.keyCode 只读且恒为 0。fireEvent 会再造一发事件，
 // Windows CI 上 229 赋完又丢，IME Escape 被当成普通关闭键。
 // 必须对同一条原生事件 dispatch，监听器读到的才是我们钉上的 keyCode。
@@ -143,9 +157,7 @@ describe('CustomProviderDialog preset locale ownership', () => {
       i18nState.language = locale;
       renderDialog();
 
-      const trigger = await screen.findByRole('button', {
-        name: 'settings.providers.custom.presets.label',
-      });
+      const trigger = await findReadyPresetTrigger();
       expect(trigger.textContent).toContain('settings.providers.custom.presets.placeholder');
 
       fireEvent.click(trigger);
@@ -165,9 +177,7 @@ describe('CustomProviderDialog preset locale ownership', () => {
     i18nState.language = 'zh-TW';
     const { onClose } = renderDialog();
 
-    const trigger = await screen.findByRole('button', {
-      name: 'settings.providers.custom.presets.label',
-    });
+    const trigger = await findReadyPresetTrigger();
 
     const heading = screen.getByRole('heading', {
       name: 'settings.providers.custom.dialog.createTitle',
@@ -194,9 +204,7 @@ describe('CustomProviderDialog preset locale ownership', () => {
     i18nState.language = 'zh-TW';
     const { onClose } = renderDialog();
 
-    const trigger = await screen.findByRole('button', {
-      name: 'settings.providers.custom.presets.label',
-    });
+    const trigger = await findReadyPresetTrigger();
     fireEvent.click(trigger);
     const option = await screen.findByRole('option', { name: '繁體供應商' });
     // 等 layout effect 把 childLayer 写进 childLayerRef。只等 option 出现不够:
@@ -204,8 +212,12 @@ describe('CustomProviderDialog preset locale ownership', () => {
     await waitFor(() => {
       expect(option.isConnected).toBe(true);
     });
-    await new Promise<void>((resolve) => { requestAnimationFrame(() => resolve()); });
-    await new Promise<void>((resolve) => { requestAnimationFrame(() => resolve()); });
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
 
     const scrim = overlayOf(
       screen.getByRole('dialog', { name: 'settings.providers.custom.dialog.createTitle' }),
@@ -232,9 +244,7 @@ describe('CustomProviderDialog preset locale ownership', () => {
     i18nState.language = 'zh-TW';
     const { onClose } = renderDialog();
 
-    const trigger = await screen.findByRole('button', {
-      name: 'settings.providers.custom.presets.label',
-    });
+    const trigger = await findReadyPresetTrigger();
     const scrim = overlayOf(
       screen.getByRole('dialog', { name: 'settings.providers.custom.dialog.createTitle' }),
     );
@@ -251,7 +261,7 @@ describe('CustomProviderDialog preset locale ownership', () => {
     i18nState.language = 'zh-TW';
     const { onClose } = renderDialog();
 
-    await screen.findByRole('button', { name: 'settings.providers.custom.presets.label' });
+    await findReadyPresetTrigger();
     fireEvent.click(screen.getByRole('button', { name: 'settings.providers.custom.cancel' }));
     expect(onClose).toHaveBeenCalledTimes(1);
   });
@@ -263,12 +273,12 @@ describe('CustomProviderDialog preset locale ownership', () => {
     i18nState.language = 'zh-TW';
     const { onClose } = renderDialog();
 
-    const trigger = await screen.findByRole('button', {
-      name: 'settings.providers.custom.presets.label',
-    });
+    const trigger = await findReadyPresetTrigger();
     fireEvent.click(trigger);
     expect(await screen.findByRole('option', { name: '繁體供應商' })).not.toBeNull();
-    await new Promise<void>((resolve) => { requestAnimationFrame(() => resolve()); });
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
 
     dispatchEscape(document, eventInit);
     expect(screen.getByRole('option', { name: '繁體供應商' })).not.toBeNull();
@@ -279,9 +289,7 @@ describe('CustomProviderDialog preset locale ownership', () => {
     i18nState.language = 'zh-TW';
     const { onClose } = renderDialog();
 
-    const trigger = await screen.findByRole('button', {
-      name: 'settings.providers.custom.presets.label',
-    });
+    const trigger = await findReadyPresetTrigger();
     fireEvent.click(trigger);
     fireEvent.click(await screen.findByRole('option', { name: '繁體供應商' }));
 
@@ -319,9 +327,7 @@ describe('CustomProviderDialog preset locale ownership', () => {
     i18nState.language = 'zh-TW';
     const { onClose } = renderDialog();
 
-    const trigger = await screen.findByRole('button', {
-      name: 'settings.providers.custom.presets.label',
-    });
+    const trigger = await findReadyPresetTrigger();
     fireEvent.click(trigger);
     fireEvent.click(await screen.findByRole('option', { name: '繁體供應商' }));
     fireEvent.click(screen.getByRole('tab', { name: 'settings.providers.custom.protocol.codex' }));
