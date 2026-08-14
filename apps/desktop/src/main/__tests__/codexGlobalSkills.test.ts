@@ -186,6 +186,83 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     );
   });
 
+  it('quarantines deferred Ghost links from verified shared legacy roots', async () => {
+    const root = await makeTmpDir();
+    const homeDir = path.join(root, 'home');
+    const codexHome = path.join(root, 'xdt-codex-home');
+    const agentsSkills = path.join(homeDir, '.agents', 'skills');
+    const userDataRoot = path.join(root, 'user-data');
+    const ownerRoot = path.join(userDataRoot, 'owners', 'owner-b');
+    const legacyCindySkill = path.join(
+      userDataRoot,
+      'cindy-brain',
+      'ghost-a',
+      'skills',
+      'profile-a',
+    );
+    const legacyBrainSkill = path.join(userDataRoot, 'brain', 'ghost-b', 'skills', 'profile-b');
+    const unrelatedBrainSkill = path.join(root, 'work', 'brain', 'acme', 'deploy');
+    const unrelatedCindySkill = path.join(
+      root,
+      'other-user-data',
+      'cindy-brain',
+      'ghost-c',
+      'skills',
+      'outside',
+    );
+    const legacyCindyLink = path.join(agentsSkills, 'ghost-a--profile-a');
+    const legacyBrainLink = path.join(agentsSkills, 'ghost-b--profile-b');
+    const unrelatedBrainLink = path.join(agentsSkills, 'acme--deploy');
+    const unrelatedCindyLink = path.join(agentsSkills, 'ghost-c--outside');
+
+    await fs.mkdir(ownerRoot, { recursive: true });
+    for (const skillDir of [
+      legacyCindySkill,
+      legacyBrainSkill,
+      unrelatedBrainSkill,
+      unrelatedCindySkill,
+    ]) {
+      await writeSkill(path.dirname(skillDir), path.basename(skillDir));
+    }
+    await linkDirectory(legacyCindySkill, legacyCindyLink);
+    await linkDirectory(legacyBrainSkill, legacyBrainLink);
+    await linkDirectory(unrelatedBrainSkill, unrelatedBrainLink);
+    await linkDirectory(unrelatedCindySkill, unrelatedCindyLink);
+
+    const reportedSkills = [
+      legacyCindyLink,
+      legacyBrainLink,
+      unrelatedBrainLink,
+      unrelatedCindyLink,
+    ].map((link) => ({ path: path.join(link, 'SKILL.md') }));
+    await expect(codexDisabledSkillPathsForOwner(reportedSkills, { ownerRoot })).resolves.toEqual(
+      [legacyCindyLink, legacyBrainLink].map((link) => path.join(link, 'SKILL.md')).sort(),
+    );
+
+    const result = await prepareCodexGlobalSkillsLinks(codexHome, { homeDir, ownerRoot });
+    const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+    expect(result.warnings).toEqual([]);
+    for (const linkName of ['ghost-a--profile-a', 'ghost-b--profile-b']) {
+      await expect(
+        fs.lstat(path.join(paths.sharedAgentsSkillsLink, linkName)),
+      ).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    }
+    expect(
+      await sameRealPath(
+        path.join(paths.sharedAgentsSkillsLink, 'acme--deploy'),
+        unrelatedBrainSkill,
+      ),
+    ).toBe(true);
+    expect(
+      await sameRealPath(
+        path.join(paths.sharedAgentsSkillsLink, 'ghost-c--outside'),
+        unrelatedCindySkill,
+      ),
+    ).toBe(true);
+  });
+
   it('keeps ordinary global Skills whose paths merely contain a brain segment', async () => {
     const root = await makeTmpDir();
     const homeDir = path.join(root, 'home');
