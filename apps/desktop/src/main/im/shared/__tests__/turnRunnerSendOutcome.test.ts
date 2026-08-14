@@ -42,7 +42,7 @@ const mocks = vi.hoisted(() => ({
   bindingGet: vi.fn(),
   bindingDetach: vi.fn(),
   peekSession: async () => null,
-  peekSessionById: async () => null,
+  peekSessionById: vi.fn<(sessionId: string) => Promise<ImSessionRow | null>>(async () => null),
   findActiveSession: vi.fn(),
   createSession: vi.fn(),
   touchUserSent: vi.fn(),
@@ -267,7 +267,7 @@ function createSessionHarness(
 const fakeRepo: ImSessionRepo = {
   sessionIdFor: (bot, user) => `feishu_${bot}_${user}`,
   peekSession: async () => null,
-  peekSessionById: async () => null,
+  peekSessionById: mocks.peekSessionById,
   findActiveSession: (...args: [string, string]) => mocks.findActiveSession(...args),
   prepareNewSession: vi.fn(async (bot: string, user: string): Promise<ImSessionRow> => ({
     id: `feishu_${bot}_${user}`,
@@ -293,6 +293,7 @@ const fakeCards = {
   buildControlPickerCard: vi.fn(),
   buildControlSessionPickerCard: vi.fn(),
   buildResolvedCard: vi.fn(),
+  buildPermissionModeFixCard: vi.fn(() => ({ title: 'fix', body: 'fix', buttons: [] })),
 } as unknown as ImCardBuilders;
 
 const fakeAdapter: ImChannelAdapter = {
@@ -1081,6 +1082,140 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
       });
     },
   );
+
+  it('skips the turn policy when the channel declares the session mode optional (Full access guardrail removal)', async () => {
+    // feishu 渠道设置显式放行「完全访问」后: 该档位的群轮次不再挂强确认
+    // 策略, maker 不 fail-closed, 按用户选择直接执行。
+    mocks.peekSessionById.mockImplementationOnce(async () => ({
+      permissionMode: 'bypassPermissions',
+    } as unknown as ImSessionRow));
+    const h = createSessionHarness(async () => ({ accepted: true }));
+    mocks.getMaker.mockReturnValue(createMakerHarness(h.session));
+    const localAdapter = {
+      ...fakeAdapter,
+      turnPolicyOptionalForMode: (mode: string) => mode === 'bypassPermissions',
+    } as unknown as ImChannelAdapter;
+    const localRunner = createTurnRunner(localAdapter, fakeRepo, fakeCards, {});
+
+    try {
+      await localRunner.runAgentTurn({
+        botContextId: 'cli_test_bot',
+        userId: 'g/oc_group1/omt_t1',
+        userMessageId: 'msg-policy-skip',
+        text: 'full access group turn',
+        attachments: [],
+        turnPermissionPolicy: {
+          origin: { kind: 'im', channel: 'feishu', taskId: 'msg-policy-skip' },
+          confirmationSurface: 'channel',
+          forceConfirmToolCall: () => false,
+        },
+      });
+
+      expect(h.session.send).toHaveBeenCalledTimes(1);
+      // 策略被渠道判定为可选 → send opts 不带 turnPermissionPolicy。
+      expect(h.session.send).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.not.objectContaining({ turnPermissionPolicy: expect.anything() }),
+      );
+      // 与策略配套的 turn lease 也不该挂。
+      expect(h.session.acquireTurnLease).not.toHaveBeenCalled();
+    } finally {
+      localRunner.disposeAllSessions();
+    }
+  });
+
+  it('keeps the turn policy for other modes even with the optional-mode hook', async () => {
+    mocks.peekSessionById.mockImplementationOnce(
+      async () => ({ permissionMode: 'auto' } as unknown as ImSessionRow),
+    );
+    const h = createSessionHarness(
+      async () => {
+        throw new TurnPermissionPolicyUnsupportedError('claude-code', 'bypassPermissions');
+      },
+      'feishu-session-2',
+      {
+        capabilities: {
+          turnPermissionPolicy: {
+            supported: { supported: true },
+            unsupportedPermissionModes: ['bypassPermissions'],
+          },
+        } as unknown as Capabilities,
+      },
+    );
+    mocks.getMaker.mockReturnValue(createMakerHarness(h.session));
+    const localAdapter = {
+      ...fakeAdapter,
+      turnPolicyOptionalForMode: (mode: string) => mode === 'bypassPermissions',
+    } as unknown as ImChannelAdapter;
+    const localRunner = createTurnRunner(localAdapter, fakeRepo, fakeCards, {});
+
+    try {
+      const dispatch = await localRunner.dispatchAgentTurn({
+        botContextId: 'cli_test_bot',
+        userId: 'g/oc_group1/omt_t1',
+        userMessageId: 'msg-policy-kept',
+        text: 'auto group turn',
+        attachments: [],
+        queueMode: 'external',
+        beforeProviderStart: vi.fn(async () => undefined),
+        turnPermissionPolicy: {
+          origin: { kind: 'im', channel: 'feishu', taskId: 'msg-policy-kept' },
+          confirmationSurface: 'channel',
+          forceConfirmToolCall: () => false,
+        },
+      });
+      // auto 档不在可选项里 — 策略保留, maker 拒绝照旧。
+      expect(dispatch).toEqual({
+        kind: 'rejected',
+        reason: 'TURN_PERMISSION_POLICY_UNSUPPORTED:mode:bypassPermissions',
+      });
+    } finally {
+      localRunner.disposeAllSessions();
+    }
+  });
+
+  it('sends a private fix card to the owner DM when a group turn is rejected for Full access', async () => {
+    const h = createSessionHarness(
+      async () => {
+        throw new TurnPermissionPolicyUnsupportedError('claude-code', 'bypassPermissions');
+      },
+      'feishu-session',
+      {
+        capabilities: {
+          turnPermissionPolicy: {
+            supported: { supported: true },
+            unsupportedPermissionModes: ['bypassPermissions'],
+          },
+        } as unknown as Capabilities,
+      },
+    );
+    mocks.getMaker.mockReturnValue(createMakerHarness(h.session));
+
+    await getRunner().runAgentTurn({
+      botContextId: 'cli_test_bot',
+      userId: 'g/oc_group1/omt_t1',
+      userMessageId: 'msg-fix-card',
+      text: 'policy failure in group',
+      attachments: [],
+      turnPermissionPolicy: {
+        origin: { kind: 'im', channel: 'feishu', taskId: 'msg-fix-card' },
+        confirmationSurface: 'channel',
+        forceConfirmToolCall: () => false,
+      },
+    });
+
+    // 群 lane 报错文案之外, 再发一张一键修复卡到 owner 私聊。
+    expect(mocks.feishuIm.sendText).toHaveBeenCalledWith(
+      'g/oc_group1/omt_t1',
+      expect.stringContaining('群/话题会话不能用'),
+      expect.anything(),
+    );
+    expect(mocks.feishuIm.sendInteractiveCard).toHaveBeenCalledWith(
+      'g/oc_group1/omt_t1',
+      expect.objectContaining({ title: expect.any(String) }),
+      { deliverToOwnerDm: true },
+    );
+  });
 
   it('does not suppress a requested close during no-op switch acquisition', async () => {
     const oldSession = createSessionHarness(async () => ({ accepted: true }));

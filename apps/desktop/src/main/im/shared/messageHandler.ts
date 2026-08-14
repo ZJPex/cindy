@@ -51,6 +51,24 @@ export function createMessageHandler(
   /** Per-user serial lock — same shape as legacy messageRouter.turnLocks. */
   const userLocks = new Map<string, Promise<void>>();
 
+  /**
+   * 提前打「已收到」表情 —— 与 turnRunner 的 ackProcessing 是同一个动作, 只是
+   * 时机更早: 群上下文拼装排在 runAgentTurn 之前, 慢的时候(回翻群历史 + 轻量
+   * 模型判断)用户几十秒看不到反馈。句柄交给 turn 接管(ImRunAgentTurnArgs
+   * .ackReactionIdPromise), 由它负责撤掉, 这里不自己清理。
+   * 渠道没有表情能力或打失败 ⇒ null, turn 也不会再补打。
+   */
+  async function ackProcessingEarly(
+    im: TextChannelIM,
+    messageId: string,
+  ): Promise<string | null> {
+    try {
+      return (await im.reactToMessage?.(messageId, adapter.processingEmoji)) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   async function processOne(
     im: TextChannelIM,
     event: IMMessageEvent,
@@ -147,14 +165,6 @@ export function createMessageHandler(
 
     // ── slash command (only on plain text: no attachments, no unsupported) ──
     if (pureTextCommandInput && looksLikeSlashCommand(event.text)) {
-      // 渠道钩子先于命令处理 — 飞书靠它记住开话题 slash 事件的群主流取数
-      // lane(thread 前上下文), 供流程结束后话题里的第一条 agent 消息使用。
-      try {
-        adapter.onSlashCommandEvent?.(event);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        log.warn(`onSlashCommandEvent threw (non-fatal): ${msg}`);
-      }
       try {
         await slash.handleSlashCommand(event.text, {
           botContextId: event.contextId,
@@ -206,7 +216,14 @@ export function createMessageHandler(
       contextAttachments?: IMAttachment[];
       commit?: () => void | Promise<void>;
     } | null = null;
+    // 「已收到」表情先落, 再拼上下文 —— 群上下文拼装要回翻群历史(可能翻页 + 调
+    // 轻量模型), 慢的时候几十秒没有任何反馈, 用户只能看着不动的消息猜 bot 是不是
+    // 挂了(实测最慢到 87s)。句柄交给 turn 接管(turn 收口时照常撤掉/换成结果
+    // 表情; turn 没建起来就 rejected 时由 turnRunner 撤掉)。
+    // undefined = 没提前打, turn 自己打(与老行为一致)。
+    let handedOverAck: Promise<string | null> | null | undefined;
     if (adapter.prepareAgentTurnText) {
+      handedOverAck = event.messageId ? ackProcessingEarly(im, event.messageId) : null;
       try {
         prepared = await adapter.prepareAgentTurnText(event);
       } catch (err) {
@@ -228,6 +245,7 @@ export function createMessageHandler(
         ...(event.protectedContent === true ? { protectedContent: true } : {}),
         ...(turnPermissionPolicy ? { turnPermissionPolicy } : {}),
         ...(groupHistoryAccess ? { groupHistoryAccess } : {}),
+        ...(handedOverAck !== undefined ? { ackReactionIdPromise: handedOverAck } : {}),
         ...(prepared ? { agentText: prepared.agentText } : {}),
         // 群历史附件只进模型消息、不落库(见 ImRunAgentTurnArgs.contextAttachments)。
         ...(prepared?.contextAttachments?.length

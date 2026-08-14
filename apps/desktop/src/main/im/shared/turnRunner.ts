@@ -382,6 +382,16 @@ export interface ImRunAgentTurnArgs {
    */
   protectedContent?: boolean;
   groupHistoryAccess?: GroupHistoryAccessScope;
+  /**
+   * 调用方已经打好的「已收到」表情句柄 —— 传了就由本 turn 接管(不再重复打),
+   * turn 收口时照常撤掉/换成结果表情。
+   *
+   * 给 messageHandler 用: 群上下文拼装(回翻群历史, 可能翻页并调轻量模型)排在
+   * runAgentTurn **之前**, 慢的时候用户几十秒看不到任何反应, 会以为 bot 挂了。
+   * 由调用方在拼装前先打表情、把句柄交进来, 反馈就不再被拼装时间挡住。
+   * 缺省(undefined)= turn 自己打, 与老行为一致。
+   */
+  ackReactionIdPromise?: Promise<string | null> | null;
 }
 
 export interface ImTurnTerminal {
@@ -628,6 +638,7 @@ export function createTurnRunner(
         if (args.queueMode === 'internal') {
           await replyMissingAuth(userId, created.missingAuth, scopeKey);
         }
+        await discardHandedOverAck(userMessageId, args.ackReactionIdPromise);
         return { kind: 'rejected', reason: 'missing_auth' };
       }
       target = created.target;
@@ -644,6 +655,7 @@ export function createTurnRunner(
             target.attached,
           );
         }
+        await discardHandedOverAck(userMessageId, args.ackReactionIdPromise);
         return { kind: 'rejected', reason: 'missing_auth' };
       }
     }
@@ -679,9 +691,14 @@ export function createTurnRunner(
     // session wiring; promise is parked on the turn so completeTurnCallback can
     // await it and remove the reaction once the turn finishes (regardless of
     // whether ack resolved before or after).
-    const ackReactionIdPromise: Promise<string | null> | null = userMessageId
-      ? ackProcessing(userMessageId)
-      : null;
+    // 调用方已经打过 ack 就接管它的句柄, 不再补打一个(飞书 reactToMessage 会
+    // 叠出第二个同款表情)。args 里显式给了 null = 调用方打失败, 同样不补。
+    const ackReactionIdPromise: Promise<string | null> | null =
+      args.ackReactionIdPromise !== undefined
+        ? args.ackReactionIdPromise
+        : userMessageId
+          ? ackProcessing(userMessageId)
+          : null;
 
     let resolveTerminal!: (terminal: ImTurnTerminal) => void;
     const terminalPromise = new Promise<ImTurnTerminal>((resolve) => {
@@ -857,6 +874,34 @@ export function createTurnRunner(
    * 典型: 接管模式下 desktop 排队消息和渠道排队消息在同一个 done 后争抢) →
    * 退回队首, 等下一个 done/error 或 retry timer 再派发, 不报错。
    */
+  /**
+   * 群护栏取缔(feishu): 渠道通过 turnPolicyOptionalForMode 声明「该权限档下
+   * 强确认策略可选」时, dispatch 前按会话当前权限档决定是否真正挂策略 —
+   * 返回 undefined = 不挂, maker 不再 fail-closed, 按用户显式选择直接执行。
+   * 群上下文的防注入过滤与包裹独立于策略, 照常生效; 查档失败保持挂策略
+   * (fail-closed 兜底)。其它渠道不实现该钩子, 行为不变。
+   */
+  async function resolveEffectiveTurnPolicy(
+    item: QueuedSend,
+  ): Promise<TurnPermissionPolicy | undefined> {
+    if (!item.turnPermissionPolicy || !adapter.turnPolicyOptionalForMode) {
+      return item.turnPermissionPolicy;
+    }
+    try {
+      const row = await repo.peekSessionById(item.rowId);
+      if (row && adapter.turnPolicyOptionalForMode(row.permissionMode)) {
+        log.info(
+          `turn policy skipped by channel (mode=${row.permissionMode}) session=${item.rowId.slice(-8)}`,
+        );
+        return undefined;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`resolveEffectiveTurnPolicy peek failed (keep policy): ${msg}`);
+    }
+    return item.turnPermissionPolicy;
+  }
+
   async function dispatchQueuedSend(
     state: SessionState,
     userId: string,
@@ -932,15 +977,19 @@ export function createTurnRunner(
           )
         : withHandoff;
 
+      // 群护栏取缔(飞书): 按会话当前权限档决定是否真正挂强确认策略, 见
+      // resolveEffectiveTurnPolicy。不挂时走与 DM 轮次相同的无策略路径。
+      const effectiveTurnPolicy = await resolveEffectiveTurnPolicy(item);
+
       const sendResult = await state.makerSession.send(outgoingMessage as typeof item.userMessage, {
         planMode: false,
-        ...(item.turnPermissionPolicy ? { turnPermissionPolicy: item.turnPermissionPolicy } : {}),
+        ...(effectiveTurnPolicy ? { turnPermissionPolicy: effectiveTurnPolicy } : {}),
         beforeProviderStart: async () => {
           // 策略轮持一张 host turn lease:期间 setPermissionMode 切到 agent 声明为
           // turnPermissionPolicy-unsupported 的档位(如 Pi Full Access)会被阻塞到本轮
           // 终态,堵死"热切到 bypass 让 bridge 直接放行、策略连冒泡机会都没有"的绕过。
           // 两个 surface 都需要:channel 与 desktop 的策略同样必须扛住热切。
-          if (item.turnPermissionPolicy) {
+          if (effectiveTurnPolicy) {
             item.turn.hostTurnLeaseRelease = state.makerSession.acquireTurnLease();
           }
           if (item.groupHistoryAccess) {
@@ -951,21 +1000,21 @@ export function createTurnRunner(
             });
           }
           item.turn.interactionRouteLease =
-            item.turnPermissionPolicy?.confirmationSurface === 'desktop'
+            effectiveTurnPolicy?.confirmationSurface === 'desktop'
               ? beginInteractionRoute(state.makerSession, {
                   route: {
                     sessionId: rowId,
                     turnId: item.turn.turnId,
-                    origin: item.turnPermissionPolicy.origin,
+                    origin: effectiveTurnPolicy.origin,
                     interactionSurface: 'desktop',
-                    ...(item.turnPermissionPolicy.confirmationTimeoutMs
+                    ...(effectiveTurnPolicy.confirmationTimeoutMs
                       ? {
-                          timeoutMs: item.turnPermissionPolicy.confirmationTimeoutMs,
+                          timeoutMs: effectiveTurnPolicy.confirmationTimeoutMs,
                         }
                       : {}),
-                    ...(item.turnPermissionPolicy.onInteractionStateChange
+                    ...(effectiveTurnPolicy.onInteractionStateChange
                       ? {
-                          onStateChange: item.turnPermissionPolicy.onInteractionStateChange,
+                          onStateChange: effectiveTurnPolicy.onInteractionStateChange,
                         }
                       : {}),
                   },
@@ -974,20 +1023,20 @@ export function createTurnRunner(
                   route: {
                     sessionId: rowId,
                     turnId: item.turn.turnId,
-                    origin: item.turnPermissionPolicy?.origin ?? { kind: 'im', channel },
+                    origin: effectiveTurnPolicy?.origin ?? { kind: 'im', channel },
                     interactionSurface: 'channel-card',
-                    ...(item.turnPermissionPolicy?.confirmationTimeoutMs
-                      ? { timeoutMs: item.turnPermissionPolicy.confirmationTimeoutMs }
+                    ...(effectiveTurnPolicy?.confirmationTimeoutMs
+                      ? { timeoutMs: effectiveTurnPolicy.confirmationTimeoutMs }
                       : {}),
-                    ...(item.turnPermissionPolicy?.onInteractionStateChange
-                      ? { onStateChange: item.turnPermissionPolicy.onInteractionStateChange }
+                    ...(effectiveTurnPolicy?.onInteractionStateChange
+                      ? { onStateChange: effectiveTurnPolicy.onInteractionStateChange }
                       : {}),
                   },
                   handle: handleInteractionFor(
                     rowId,
                     userId,
                     state.scopeKey,
-                    item.turnPermissionPolicy?.confirmationTimeoutMs,
+                    effectiveTurnPolicy?.confirmationTimeoutMs,
                   ),
                   // 文本渠道自己认领掉的不动卡片(它本来就没有卡);其余走
                   // dropInteractionCard —— 作废 pending 的同时把那张卡收口。
@@ -1598,7 +1647,9 @@ export function createTurnRunner(
         adapter.ui.cards.permission.dmRoutedNotice
       ) {
         try {
-          await im.sendText(userId, adapter.ui.cards.permission.dmRoutedNotice, {
+          const notice = adapter.ui.cards.permission.dmRoutedNotice;
+          const text = typeof notice === 'function' ? notice(req.toolName) : notice;
+          await im.sendText(userId, text, {
             threadTs: scopeKey,
           });
         } catch (err) {
@@ -1799,6 +1850,24 @@ export function createTurnRunner(
       return (await im.reactToMessage?.(messageId, adapter.processingEmoji)) ?? null;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * 撤掉**调用方交进来的** ack 表情 —— 只用在 TurnState 还没建起来就 rejected
+   * 的路径上(missing_auth)。那个表情是调用方在 dispatch 之前打的, 这里不撤就
+   * 永久卡在用户消息上。turn 建起来之后的清理照旧走 cancelAckReaction。
+   */
+  async function discardHandedOverAck(
+    messageId: string,
+    promise: Promise<string | null> | null | undefined,
+  ): Promise<void> {
+    if (!promise || !messageId) return;
+    try {
+      const reactionId = await promise;
+      if (reactionId) await im.removeMessageReaction?.(messageId, reactionId);
+    } catch {
+      /* 忽略失败：表情清理是尽力而为。 */
     }
   }
 
@@ -2386,12 +2455,17 @@ export function createTurnRunner(
     await completeTurnCallbackAfterAck(failure.turn);
     if (failure.turn.queueMode === 'internal') {
       try {
-        // 群轮次强确认策略与「完全访问」档互斥(maker fail-closed 拒绝) — 给
-        // 用户能看懂的说法并指路 /permission, 而不是裸抛策略错误码。
+        // 群轮次强确认策略与不支持档互斥(maker fail-closed 拒绝;「完全访问」
+        // 已由渠道设置显式放行, 实际只剩 acceptEdits)— 给用户能看懂的说法并
+        // 指路 /permission + 私聊修复卡, 而不是裸抛策略错误码。
         const policyUnsupported = failure.reason.startsWith('TURN_PERMISSION_POLICY_UNSUPPORTED');
+        const rejectedMode = failure.reason.split(':')[2] ?? '';
+        const unsupportedCopy = adapter.ui.error?.permissionModeUnsupported;
         const message =
-          policyUnsupported && adapter.ui.error?.permissionModeUnsupported
-            ? adapter.ui.error.permissionModeUnsupported
+          policyUnsupported && unsupportedCopy
+            ? typeof unsupportedCopy === 'function'
+              ? unsupportedCopy(rejectedMode)
+              : unsupportedCopy
             : `❌ 启动 agent 失败：${failure.reason}`;
         if (
           output.kind === 'chunked-text' &&
@@ -2408,6 +2482,40 @@ export function createTurnRunner(
           await im.sendText(userId, message, {
             threadTs: state.scopeKey,
           });
+        }
+        // 群会话「完全访问」档被强确认策略拒绝: 报错文案之外, 再给 owner
+        // 私聊发一张一键修复卡(切回 auto)。只对提供 permissionModeFix 文案
+        // 的渠道(飞书)与群 lane 生效 — 私聊不挂群策略, 防御性跳过; 卡片
+        // 发送失败不阻塞收口(用户仍可 /permission 手动切)。
+        if (
+          policyUnsupported &&
+          adapter.ui.cards.permissionModeFix &&
+          output.kind === 'rich-card' &&
+          userId.startsWith('g/')
+        ) {
+          try {
+            // 动态 import: 保持 turnRunner 静态依赖链不因修复卡拖进 controlProjects
+            // (列表扫描是重模块, 单测 harness 不 mock 它)。
+            const [{ readSessionTitle }] = await Promise.all([import('./controlProjects')]);
+            let sessionTitle = '';
+            try {
+              sessionTitle = (await readSessionTitle(state.makerSession.id)) ?? '';
+            } catch {
+              /* title 查不到就省略, 卡片 body 回落 sessionId 尾号 */
+            }
+            const fixSpec = cards.buildPermissionModeFixCard({
+              sessionId: state.makerSession.id,
+              agentKind: state.makerSession.agentKind,
+              sessionTitle: sessionTitle || state.makerSession.id.slice(-8),
+            });
+            await output.im.sendInteractiveCard(userId, fixSpec, { deliverToOwnerDm: true });
+            log.info(
+              `permissionModeFix card sent to owner DM for session=...${state.makerSession.id.slice(-8)}`,
+            );
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log.warn(`permissionModeFix card send failed (non-fatal): ${msg}`);
+          }
         }
       } catch {
         /* 忽略失败：派发失败提示不能再阻塞收口。 */
@@ -2973,7 +3081,9 @@ export function createTurnRunner(
           adapter.ui.cards.permission.dmRoutedNotice
         ) {
           try {
-            await im.sendText(userId, adapter.ui.cards.permission.dmRoutedNotice, {
+            const notice = adapter.ui.cards.permission.dmRoutedNotice;
+            const text = typeof notice === 'function' ? notice(req.toolName) : notice;
+            await im.sendText(userId, text, {
               threadTs: scopeKey,
             });
           } catch (err) {

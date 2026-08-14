@@ -691,6 +691,11 @@ async function handleIncomingMessage(botAppId: string, data: RawMessageEvent): P
       laneUserId = encodeLaneUserId(chatId, incomingThreadId);
       outbound.pushReplyAnchor(laneUserId, messageId);
     } else {
+      // 群主流的 @ 恒开新话题 —— 群里存在 /ctr 接管也不例外: 接管严格按话题
+      // 记账(binding 的 userId 就是话题 lane), 群主流不是任何接管的入口。
+      // 拿接管话题去截流群主流消息会让「群里随便 @ 一句」都掉进那条被接管的
+      // 会话(用户感知: 不管在哪问, 工作目录都是绑定那个项目)。要跟接管会话
+      // 说话就在那个话题里说。
       const opener = await outbound.openThread(messageId);
       if (opener) {
         laneUserId = encodeLaneUserId(chatId, opener.threadId);
