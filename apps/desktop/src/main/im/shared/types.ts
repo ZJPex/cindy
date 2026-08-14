@@ -216,6 +216,14 @@ export interface ImChannelAdapter {
   turnPermissionPolicyFor?(event: IMMessageEvent): TurnPermissionPolicy | undefined;
   /** Telegram 每轮的群历史检索授权；其它渠道不实现即 fail closed。 */
   groupHistoryAccessFor?(event: IMMessageEvent): GroupHistoryAccessScope | undefined;
+  /**
+   * slash 命令事件的渠道钩子 — 在 handleSlashCommand 之前调用。飞书用它记住
+   * 「群主流 @ 开话题」事件带的群主流取数 lane(groupContextLane): /ctr 等
+   * slash 不经过 prepareAgentTurnText, 开话题那条事件攒下的 thread 前上下文
+   * 会丢失; 记住后由话题里第一条 agent 消息领走(见 adapter 实现)。
+   * 其它渠道不实现即 no-op。
+   */
+  onSlashCommandEvent?(event: IMMessageEvent): void;
 }
 
 // ── UI 文案包 ─────────────────────────────────────────────────────────────────

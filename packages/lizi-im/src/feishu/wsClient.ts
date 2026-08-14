@@ -742,6 +742,16 @@ async function handleCardAction(data: unknown): Promise<unknown> {
   try {
     const event = parseCardAction({ raw: data });
     if (event) {
+      // 群卡片的回调 senderId 归一成发卡 lane(与消息侧 /ctr 锁、接管 binding
+      // 的键一致, 否则锁永远清不掉);私聊卡 / 改投 DM 卡没有登记, 保持
+      // operator.open_id。白名单校验仍以 operator.open_id 为准(parser 内)。
+      const lane = outbound.resolveCardLane(event.messageId, event.chatId);
+      if (lane) {
+        event.senderId = lane;
+        log.info(
+          `[feishu/wsClient] card action sender normalized to lane ...${lane.slice(-8)}`,
+        );
+      }
       // Keep the Feishu callback path short: card handlers often patch the
       // same message, and doing that before the action ACK returns can race
       // the client-side card action state. Dispatch on the next tick so the

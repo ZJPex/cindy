@@ -5580,6 +5580,7 @@
         "context": "{{value}} 上下文",
         "codexCompatibilityMode": "Codex 相容模式",
         "price": "{{input}}/{{output}} / 百萬",
+        "subscriptionBadgeCompact": "訂閱",
         "fastBadge": "快速"
       },
       "source": {

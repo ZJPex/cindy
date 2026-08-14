@@ -173,6 +173,44 @@ async function resolveChatName(feishuIm: FeishuIM, chatId: string): Promise<stri
   return name;
 }
 
+// ── 群主流 @ 开话题的「thread 前上下文」取数 lane 记忆 ────────────────────────
+// 开话题事件(groupContextLane)若是 slash(如 /ctr), prepareAgentTurnText 不会
+// 被调用, 群主流上下文取数 lane 随之丢失;记下来, 由话题里第一条 agent 消息
+// 领走(take 后即删, 只补一次 — 与开话题事件「只有首条消息看群主流」的口径
+// 一致)。TTL + 上限兜底, 防用户开话题后永不发消息造成的无界增长。
+
+const MAIN_FLOW_CONTEXT_TTL_MS = 24 * 60 * 60 * 1000;
+const MAIN_FLOW_CONTEXT_MAX_ENTRIES = 64;
+const mainFlowContextLanes = new Map<string, { ts: number; lane: FeishuLane }>();
+
+function rememberMainFlowContextLane(topicLaneUserId: string, mainFlowLane: FeishuLane): void {
+  const now = Date.now();
+  for (const [laneId, entry] of mainFlowContextLanes) {
+    if (now - entry.ts > MAIN_FLOW_CONTEXT_TTL_MS) mainFlowContextLanes.delete(laneId);
+  }
+  while (mainFlowContextLanes.size > MAIN_FLOW_CONTEXT_MAX_ENTRIES) {
+    let oldestKey: string | undefined;
+    let oldestTs = Number.POSITIVE_INFINITY;
+    for (const [laneId, entry] of mainFlowContextLanes) {
+      if (entry.ts < oldestTs) {
+        oldestTs = entry.ts;
+        oldestKey = laneId;
+      }
+    }
+    if (oldestKey === undefined) break;
+    mainFlowContextLanes.delete(oldestKey);
+  }
+  mainFlowContextLanes.set(topicLaneUserId, { ts: now, lane: mainFlowLane });
+}
+
+/** 领取话题 lane 记忆的群主流取数 lane(一次性, 领完即删);无则返回 undefined。 */
+function takeMainFlowContextLane(topicLaneUserId: string): FeishuLane | undefined {
+  const entry = mainFlowContextLanes.get(topicLaneUserId);
+  if (!entry) return undefined;
+  mainFlowContextLanes.delete(topicLaneUserId);
+  return entry.lane;
+}
+
 export function buildFeishuAdapter(
   feishuIm: FeishuIM,
   config: ImOrchestratorConfig,
@@ -239,19 +277,43 @@ export function buildFeishuAdapter(
         return lane !== null && lane.threadId === '';
       },
       // 话题 lane 的 oneshot 标题拼装: [飞书·{群名}·{话题简介}] {threadId 后 6 位}
-      // — 群名拉不到时退化为 [飞书·话题·{简介}]。DM/群主流 lane 返回 null,
-      // 回落默认 generatedTitlePrefix 路径(DM → [飞书·DM] {简介})。
+      // — 群名拉不到时退化为 [飞书·话题·{简介}]。DM 返回 null, 回落默认
+      // generatedTitlePrefix 路径(DM → [飞书·DM] {简介})。
+      // 群主流 lane 拼固定名 [飞书·群] {群名|chatId 后 6 位}, 与 defaultTitle /
+      // resolveSessionTitle 同族 — 非 ctr 群主流会话不参与 oneshot
+      // (skipOneshotTitleFor), 只有 /ctr 新建的接管会话走到这里, 命名与
+      // 群会话族对齐(oneshot 文本用不上, 有意忽略)。
       composeGeneratedTitle: async (userId, _scopeKey, generated) => {
         const lane = decodeFeishuLaneUserId(userId);
-        if (!lane || !lane.threadId) return null;
-        const name = await resolveChatName(feishuIm, lane.chatId);
+        if (!lane) return null;
         const label = isLark() ? 'Lark' : '飞书';
+        if (!lane.threadId) {
+          const name = await resolveChatName(feishuIm, lane.chatId);
+          return `[${label}·群] ${name ?? lane.chatId.slice(-6)}`;
+        }
+        const name = await resolveChatName(feishuIm, lane.chatId);
         const mid = name ? `${label}·${name}·${generated}` : `${label}·话题·${generated}`;
         return `[${mid}] ${lane.threadId.slice(-6)}`;
       },
     },
     processingEmoji: REACTION_PROCESSING,
     buildVendorOptions: (userId) => ({ feishuChatId: userId, source: 'feishu' }),
+
+    // ── /ctr 流程的「thread 前上下文」记忆 ─────────────────────────────────
+    // 群主流 @ 开新话题时, 触发事件带 groupContextLane(群主流取数 lane)——
+    // 但 /ctr 是 slash 命令, 不走 prepareAgentTurnText, 开话题那条事件攒下的
+    // 上下文取数 lane 直接浪费; 流程结束后话题里的第一条消息只按话题容器拉
+    // 历史, thread 创建前的群主流讨论就此丢失。这里在 slash 事件时记住
+    // 「话题 lane → 群主流 lane」, 话题里的第一条 agent 消息把它领走
+    // (take, 一次性)当取数 lane 用 — 与开话题事件的 groupContextLane 同语义。
+    // 只记话题 lane(群主流降级 lane 的话题消息本就按群主流取数, 无需补);
+    // TTL + 上限防泄漏。DM 事件无 groupContextLane, 不受影响。
+    onSlashCommandEvent: (event) => {
+      if (!event.groupContextLane) return;
+      const lane = decodeFeishuLaneUserId(event.senderId);
+      if (!lane || !lane.threadId) return;
+      rememberMainFlowContextLane(event.senderId, event.groupContextLane);
+    },
     // 群轮次(speaker 存在)统一挂强确认策略 — 群历史前缀携带成员可控文本,
     // 注入可借 owner 轮次的宽松档执行危险操作; 确认卡经 deliverToOwnerDm
     // 改投 owner 私聊, 点击也只认 owner。DM 不挂, owner 私聊保持全速。
@@ -264,7 +326,10 @@ export function buildFeishuAdapter(
       // 群主流 @ 开新话题: 上下文取数 lane 与路由 lane 分离(见
       // IMMessageEvent.groupContextLane) — 新话题是空的, 群历史仍按群主流
       // 拉取, 「总结上面」等依赖上文的消息才能拿到上下文。
-      const contextLane = event.groupContextLane ?? lane;
+      // 开话题事件本身是 slash(如 /ctr)时不经过这里: 取数 lane 由
+      // onSlashCommandEvent 记住, 话题里第一条 agent 消息来此领走。
+      const contextLane =
+        event.groupContextLane ?? takeMainFlowContextLane(event.senderId) ?? lane;
       const built = await buildFeishuGroupContext({
         lane: contextLane,
         triggerMessageId: event.messageId,
@@ -276,7 +341,7 @@ export function buildFeishuAdapter(
           judgePageRelevant: judgeHistoryPageRelevant,
           scanInjection: scanHistoryInjection,
           notifyFetchFailure: (errMsg) =>
-            notifyContextFetchFailure(feishuIm, lane, errMsg, isLark()),
+            notifyContextFetchFailure(feishuIm, contextLane, errMsg, isLark()),
           log,
         },
       });

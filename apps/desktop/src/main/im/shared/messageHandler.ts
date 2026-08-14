@@ -147,6 +147,14 @@ export function createMessageHandler(
 
     // ── slash command (only on plain text: no attachments, no unsupported) ──
     if (pureTextCommandInput && looksLikeSlashCommand(event.text)) {
+      // 渠道钩子先于命令处理 — 飞书靠它记住开话题 slash 事件的群主流取数
+      // lane(thread 前上下文), 供流程结束后话题里的第一条 agent 消息使用。
+      try {
+        adapter.onSlashCommandEvent?.(event);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`onSlashCommandEvent threw (non-fatal): ${msg}`);
+      }
       try {
         await slash.handleSlashCommand(event.text, {
           botContextId: event.contextId,

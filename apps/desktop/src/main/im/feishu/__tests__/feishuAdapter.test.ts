@@ -63,7 +63,7 @@ const fetchChatHistoryPage = vi.fn<
 >(async () => ({ messages: [], nextPageToken: null }));
 const downloadMessageAttachments = vi.fn(async () => ({ attachments: [], unsupported: [] }));
 const getOwnerOpenId = vi.fn(() => 'ou_owner');
-const sendMarkdownText = vi.fn(async (_userId: string, _text: string) => ({ messageId: 'om_notice' }));
+const sendMarkdownText = vi.fn(async () => ({ messageId: 'om_notice' }));
 const getChatName = vi.fn<(chatId: string) => Promise<string | null>>(async () => null);
 const getStatus = vi.fn<() => IMStatus>(() => ({ kind: 'connected', appId: 'cli_abc' }));
 const fakeIm = {
@@ -234,7 +234,7 @@ describe('feishu group lane adapter hooks', () => {
     ).toBe('[飞书·产品交流群·周进度总结] 9ce6ab');
   });
 
-  it('composeGeneratedTitle: 群名未知退化为 [飞书·话题·{简介}]; DM/群主流 lane 返回 null 回落', async () => {
+  it('composeGeneratedTitle: 群名未知退化为 [飞书·话题·{简介}]; DM 返回 null 回落', async () => {
     getChatName.mockResolvedValueOnce(null);
     expect(
       await adapter.sessions.composeGeneratedTitle?.('g/oc_chat6/omt_t2', undefined, '简介', 's1'),
@@ -242,9 +242,19 @@ describe('feishu group lane adapter hooks', () => {
     expect(
       await adapter.sessions.composeGeneratedTitle?.('ou_owner', undefined, 'x', 's1'),
     ).toBeNull();
+  });
+
+  it('composeGeneratedTitle: 群主流 lane 拼 [飞书·群] {群名|chatId 后 6 位}(/ctr 接管会话命名对齐群会话族)', async () => {
+    // 非 ctr 群主流会话不参与 oneshot(skipOneshotTitleFor), 只有 /ctr 新建的
+    // 接管会话走到这里 — 固定名与 defaultTitle/resolveSessionTitle 同族。
+    getChatName.mockResolvedValueOnce('产品交流群');
     expect(
-      await adapter.sessions.composeGeneratedTitle?.('g/oc_chat6', undefined, 'x', 's1'),
-    ).toBeNull();
+      await adapter.sessions.composeGeneratedTitle?.('g/oc_chat7', undefined, 'x', 's1'),
+    ).toBe('[飞书·群] 产品交流群');
+    getChatName.mockResolvedValueOnce(null);
+    expect(
+      await adapter.sessions.composeGeneratedTitle?.('g/oc_1234567890', undefined, 'x', 's1'),
+    ).toBe('[飞书·群] 567890');
   });
 
   it('群轮次(speaker 存在)挂 channel 强确认策略; DM 不挂', () => {
@@ -295,6 +305,70 @@ describe('feishu group lane adapter hooks', () => {
       expect.objectContaining({ threadId: 'omt_new1' }),
     );
     expect(result?.agentText).toContain('群主流背景');
+  });
+
+  it('prepareAgentTurnText: /ctr 开话题事件记忆的群主流取数 lane 被话题首条消息领走(一次性)', async () => {
+    // 群主流 @ "/ctr" 开新话题: slash 不经过 prepareAgentTurnText, 取数 lane
+    // 由 onSlashCommandEvent 记住; 流程结束后话题里第一条 agent 消息按群主流
+    // 拉历史(thread 创建前的上下文), 第二条起回到话题容器。
+    adapter.onSlashCommandEvent?.(
+      groupEvent({
+        senderId: 'g/oc_chat9/omt_ctr1',
+        groupContextLane: { chatId: 'oc_chat9', threadId: '' },
+      }),
+    );
+    fetchChatHistoryPage.mockResolvedValueOnce(
+      historyPage([historyEntry({ messageId: 'om_h1', threadId: '', text: '群主流背景' })]),
+    );
+    const first = await adapter.prepareAgentTurnText?.(
+      groupEvent({ senderId: 'g/oc_chat9/omt_ctr1' }),
+    );
+    expect(fetchChatHistoryPage).toHaveBeenCalledWith(
+      expect.objectContaining({ chatId: 'oc_chat9' }),
+    );
+    expect(fetchChatHistoryPage).not.toHaveBeenCalledWith(
+      expect.objectContaining({ threadId: 'omt_ctr1' }),
+    );
+    expect(first?.agentText).toContain('群主流背景');
+
+    // 一次性: 第二条消息回到话题容器。
+    fetchChatHistoryPage.mockResolvedValueOnce(
+      historyPage([historyEntry({ messageId: 'om_h2', threadId: 'omt_ctr1', text: '话题内消息' })]),
+    );
+    const second = await adapter.prepareAgentTurnText?.(
+      groupEvent({ senderId: 'g/oc_chat9/omt_ctr1' }),
+    );
+    expect(fetchChatHistoryPage).toHaveBeenLastCalledWith(
+      expect.objectContaining({ chatId: 'oc_chat9', threadId: 'omt_ctr1' }),
+    );
+    expect(second?.agentText).toContain('话题内消息');
+    expect(second?.agentText).not.toContain('群主流背景');
+  });
+
+  it('prepareAgentTurnText: 话题内 slash 事件无 groupContextLane, 不建立记忆(走话题容器)', async () => {
+    adapter.onSlashCommandEvent?.(groupEvent({ senderId: 'g/oc_chat10/omt_ctr2' }));
+    fetchChatHistoryPage.mockResolvedValueOnce(
+      historyPage([historyEntry({ messageId: 'om_h1', threadId: 'omt_ctr2', text: '话题内消息' })]),
+    );
+    const result = await adapter.prepareAgentTurnText?.(
+      groupEvent({ senderId: 'g/oc_chat10/omt_ctr2' }),
+    );
+    expect(fetchChatHistoryPage).toHaveBeenCalledWith(
+      expect.objectContaining({ chatId: 'oc_chat10', threadId: 'omt_ctr2' }),
+    );
+    expect(result?.agentText).toContain('话题内消息');
+  });
+
+  it('prepareAgentTurnText: DM slash 事件不受记忆机制影响', async () => {
+    adapter.onSlashCommandEvent?.(
+      groupEvent({ senderId: 'ou_owner', groupContextLane: { chatId: 'oc_chat11', threadId: '' } }),
+    );
+    fetchChatHistoryPage.mockClear();
+    const result = await adapter.prepareAgentTurnText?.(
+      groupEvent({ senderId: 'ou_owner', speaker: undefined }),
+    );
+    expect(result).toBeNull();
+    expect(fetchChatHistoryPage).not.toHaveBeenCalled();
   });
 
   it('prepareAgentTurnText: 话题 lane 按 thread 容器拉取, 只取本话题的消息', async () => {
