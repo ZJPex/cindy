@@ -1165,12 +1165,16 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
     const approvedGhostSkills = this.approvedGhostSkillSourceProvider?.();
     assertOwnerStable();
 
+    // Codex Skill 准备会发布 xdt-agents 并删除旧的内容寻址投影；两步必须共用
+    // 跨进程锁，避免共享 userData 的 dev / packaged 实例互删对方刚发布的目录。
     const [skillsOutcome, rulesOutcome, pluginsOutcome] = await Promise.all([
-      prepareCodexGlobalSkillsLinks(this.codexHome, {
-        ownerRoot: owner.ownerRoot,
-        ...(approvedGhostSkills ? { approvedGhostSkills } : {}),
-        assertOwnerStable,
-      }).then(
+      withSharedGlobalSkillProjectionMutation(owner.ownerId, () =>
+        prepareCodexGlobalSkillsLinks(this.codexHome, {
+          ownerRoot: owner.ownerRoot,
+          ...(approvedGhostSkills ? { approvedGhostSkills } : {}),
+          assertOwnerStable,
+        }),
+      ).then(
         (r) => ({
           ok: true as const,
           label: 'skills' as const,

@@ -7,6 +7,10 @@ const harness = vi.hoisted(() => ({
   ownerRoot: '/data/owners/owner-a',
   userDataDir: '/tmp/cindy-codex-assets-owner-scope',
   homeDir: '/home/test-user',
+  sharedMutationOwners: [] as Array<string | null>,
+  sharedMutationDepth: 0,
+  sharedPrepDepths: [] as number[],
+  codexPrepDepths: [] as number[],
 }));
 
 vi.mock('electron', () => ({
@@ -43,12 +47,89 @@ vi.mock('../../appSessionState.js', () => ({
   ownerScopedUserDataPath: () => harness.ownerRoot,
 }));
 
+vi.mock('../../authBoundaryQuarantine.js', () => ({
+  assertGhostSkillProjectionBoundaryStableForOwner: vi.fn(),
+  withSharedGlobalSkillProjectionMutation: vi.fn(
+    async <T>(ownerId: string | null, mutation: () => Promise<T>): Promise<T> => {
+      harness.sharedMutationOwners.push(ownerId);
+      harness.sharedMutationDepth += 1;
+      try {
+        return await mutation();
+      } finally {
+        harness.sharedMutationDepth -= 1;
+      }
+    },
+  ),
+}));
+
+vi.mock('../shared-global-skills.js', () => ({
+  prepareSharedGlobalSkillLinks: vi.fn(async () => {
+    harness.sharedPrepDepths.push(harness.sharedMutationDepth);
+    return { warnings: [] };
+  }),
+}));
+
+vi.mock('../codex-global-skills.js', () => ({
+  prepareCodexGlobalSkillsLinks: vi.fn(async () => {
+    harness.codexPrepDepths.push(harness.sharedMutationDepth);
+    return { changed: false, warnings: [] };
+  }),
+}));
+
+vi.mock('../codex-global-rules.js', () => ({
+  prepareCodexGlobalRulesCopy: vi.fn(async () => ({ warnings: [] })),
+}));
+
+vi.mock('../codex-global-plugins.js', () => ({
+  prepareCodexGlobalPluginsBridge: vi.fn(async () => ({
+    warnings: [],
+    routingFailures: [],
+  })),
+}));
+
 describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
   beforeEach(() => {
     harness.ownerId = 'owner-a';
     harness.ownerScopeKey = 'cloud:owner-a:1';
     harness.ownerGeneration = 1;
     harness.ownerRoot = '/data/owners/owner-a';
+    harness.sharedMutationOwners = [];
+    harness.sharedMutationDepth = 0;
+    harness.sharedPrepDepths = [];
+    harness.codexPrepDepths = [];
+  });
+
+  it('keeps Codex projection publication and stale cleanup inside the shared mutation lock', async () => {
+    const { DesktopCodexAuthAdapter } = await import('../auth-adapters.js');
+    const adapter = Object.create(DesktopCodexAuthAdapter.prototype) as {
+      skillsProjectionEpoch: number;
+    };
+    Object.defineProperty(adapter, 'skillsProjectionEpoch', {
+      configurable: true,
+      writable: true,
+      value: 0,
+    });
+    const runEnsureGlobalCodexAssets = (
+      DesktopCodexAuthAdapter.prototype as unknown as {
+        runEnsureGlobalCodexAssets(owner: {
+          ownerId: string;
+          ownerRoot: string;
+          ownerScopeKey: string;
+        }): Promise<{ skillsProjectionEpoch: number }>;
+      }
+    ).runEnsureGlobalCodexAssets;
+
+    await expect(
+      runEnsureGlobalCodexAssets.call(adapter, {
+        ownerId: 'owner-a',
+        ownerRoot: '/data/owners/owner-a',
+        ownerScopeKey: 'cloud:owner-a:1',
+      }),
+    ).resolves.toEqual({ skillsProjectionEpoch: 0 });
+
+    expect(harness.sharedMutationOwners).toEqual(['owner-a', 'owner-a']);
+    expect(harness.sharedPrepDepths).toEqual([1]);
+    expect(harness.codexPrepDepths).toEqual([1]);
   });
 
   it(
