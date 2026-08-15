@@ -786,12 +786,16 @@ export function AddProviderWizard({
             return {
               id: m.id,
               name: m.name,
+              ...(agent === 'pi' && presetModel?.piApi ? { piApi: presetModel.piApi } : {}),
               ...(contextWindow !== undefined ? { contextWindow } : {}),
               ...(presetModel?.supportsImageInput === true ? { supportsImageInput: true } : {}),
               ...(presetModel?.reasoning === true && presetModel.reasoningEfforts?.length
                 ? {
                     reasoning: true,
                     reasoningEfforts: [...presetModel.reasoningEfforts],
+                    ...(presetModel.reasoningDefaultEffort
+                      ? { reasoningDefaultEffort: presetModel.reasoningDefaultEffort }
+                      : {}),
                   }
                 : {}),
             };
@@ -804,6 +808,7 @@ export function AddProviderWizard({
           models: agentModels,
           ...(rt.headers ? { headers: rt.headers } : {}),
           ...(rt.modelsUrl ? { modelsUrl: rt.modelsUrl } : {}),
+          ...(rt.piCatalogProviderId ? { piCatalogProviderId: rt.piCatalogProviderId } : {}),
         };
         if (preset.authMethod !== 'none') {
           const k = apiKey.trim();
