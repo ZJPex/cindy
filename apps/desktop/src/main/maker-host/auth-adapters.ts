@@ -804,6 +804,8 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
    * 代次 sticky 保证每个 cwd 在首次使用新投影时仍会 forceReload。
    */
   private skillsProjectionEpoch = 0;
+  /** 上次由本进程确认的内容寻址投影，用于感知其他进程已经完成的发布。 */
+  private observedAgentsProjectionIdentity: string | null | undefined;
   private skillsListReloadedEpochByCwd = new Map<string, number>();
 
   /**
@@ -1180,6 +1182,7 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
           label: 'skills' as const,
           warnings: r.warnings,
           changed: r.changed,
+          agentsProjectionIdentity: r.agentsProjectionIdentity,
         }),
         (err: Error) => ({ ok: false as const, label: 'skills' as const, err }),
       ),
@@ -1230,8 +1233,22 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
         `Cannot start Codex safely because Cindy could not isolate a downstream plugin capability: ${pluginsOutcome.routingFailures.join('; ')}`,
       );
     }
-    if (skillsOutcome.ok && skillsOutcome.changed) {
-      this.skillsProjectionEpoch += 1;
+    if (skillsOutcome.ok) {
+      const previousIdentity = this.observedAgentsProjectionIdentity;
+      const nextIdentity = skillsOutcome.agentsProjectionIdentity;
+      if (nextIdentity !== undefined) {
+        this.observedAgentsProjectionIdentity = nextIdentity;
+      }
+      // 首次观察没有旧 app-server 缓存，无需额外推进代次。此后即使本轮没有写盘，
+      // 只要观察到另一进程发布了新投影，也必须让每个 cwd 在首次使用时 forceReload。
+      if (
+        skillsOutcome.changed ||
+        (previousIdentity !== undefined &&
+          nextIdentity !== undefined &&
+          previousIdentity !== nextIdentity)
+      ) {
+        this.skillsProjectionEpoch += 1;
+      }
     }
     return { skillsProjectionEpoch: this.skillsProjectionEpoch };
   }

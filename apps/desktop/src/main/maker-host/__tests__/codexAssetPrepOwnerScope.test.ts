@@ -11,6 +11,7 @@ const harness = vi.hoisted(() => ({
   sharedMutationDepth: 0,
   sharedPrepDepths: [] as number[],
   codexPrepDepths: [] as number[],
+  codexProjectionIdentity: 'agents-a' as string | null,
 }));
 
 vi.mock('electron', () => ({
@@ -72,7 +73,11 @@ vi.mock('../shared-global-skills.js', () => ({
 vi.mock('../codex-global-skills.js', () => ({
   prepareCodexGlobalSkillsLinks: vi.fn(async () => {
     harness.codexPrepDepths.push(harness.sharedMutationDepth);
-    return { changed: false, warnings: [] };
+    return {
+      changed: false,
+      warnings: [],
+      agentsProjectionIdentity: harness.codexProjectionIdentity,
+    };
   }),
 }));
 
@@ -97,6 +102,49 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
     harness.sharedMutationDepth = 0;
     harness.sharedPrepDepths = [];
     harness.codexPrepDepths = [];
+    harness.codexProjectionIdentity = 'agents-a';
+  });
+
+  it('advances the local epoch when another process publishes a new projection identity', async () => {
+    const { DesktopCodexAuthAdapter } = await import('../auth-adapters.js');
+    const adapter = Object.create(DesktopCodexAuthAdapter.prototype) as {
+      skillsProjectionEpoch: number;
+      observedAgentsProjectionIdentity: string | null | undefined;
+    };
+    Object.defineProperties(adapter, {
+      skillsProjectionEpoch: { configurable: true, writable: true, value: 0 },
+      observedAgentsProjectionIdentity: {
+        configurable: true,
+        writable: true,
+        value: undefined,
+      },
+    });
+    const runEnsureGlobalCodexAssets = (
+      DesktopCodexAuthAdapter.prototype as unknown as {
+        runEnsureGlobalCodexAssets(owner: {
+          ownerId: string;
+          ownerRoot: string;
+          ownerScopeKey: string;
+        }): Promise<{ skillsProjectionEpoch: number }>;
+      }
+    ).runEnsureGlobalCodexAssets;
+    const owner = {
+      ownerId: 'owner-a',
+      ownerRoot: '/data/owners/owner-a',
+      ownerScopeKey: 'cloud:owner-a:1',
+    };
+
+    await expect(runEnsureGlobalCodexAssets.call(adapter, owner)).resolves.toEqual({
+      skillsProjectionEpoch: 0,
+    });
+
+    harness.codexProjectionIdentity = 'agents-b';
+    await expect(runEnsureGlobalCodexAssets.call(adapter, owner)).resolves.toEqual({
+      skillsProjectionEpoch: 1,
+    });
+    await expect(runEnsureGlobalCodexAssets.call(adapter, owner)).resolves.toEqual({
+      skillsProjectionEpoch: 1,
+    });
   });
 
   it('keeps Codex projection publication and stale cleanup inside the shared mutation lock', async () => {

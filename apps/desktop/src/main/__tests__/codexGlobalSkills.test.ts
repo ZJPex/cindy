@@ -1,7 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
-import { promises as fs } from 'node:fs';
-import { afterEach, describe, expect, it } from 'vitest';
+import { Dirent, promises as fs } from 'node:fs';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { InstalledGhost } from '../../shared/ghost';
 
@@ -608,7 +608,7 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     ).toBe(true);
   });
 
-  it('projects the current owner copy when another Profile occupies the shared link name', async () => {
+  it('uses lstat when an unknown d_type hides another Profile shared symlink', async () => {
     const root = await makeTmpDir();
     const homeDir = path.join(root, 'home');
     const codexHome = path.join(root, 'xdt-codex-home');
@@ -624,11 +624,17 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     await linkDirectory(ownerASkill, sharedLink);
 
     const paths = codexGlobalSkillsPaths(codexHome, homeDir);
-    const result = await prepareCodexGlobalSkillsLinks(codexHome, {
-      homeDir,
-      ownerRoot: ownerBRoot,
-      approvedGhostSkills: approvedGhostSkills([ownerBApproved.ghost]),
-    });
+    const direntSymlinkType = vi.spyOn(Dirent.prototype, 'isSymbolicLink').mockReturnValue(false);
+    let result: Awaited<ReturnType<typeof prepareCodexGlobalSkillsLinks>>;
+    try {
+      result = await prepareCodexGlobalSkillsLinks(codexHome, {
+        homeDir,
+        ownerRoot: ownerBRoot,
+        approvedGhostSkills: approvedGhostSkills([ownerBApproved.ghost]),
+      });
+    } finally {
+      direntSymlinkType.mockRestore();
+    }
 
     expect(result.warnings).toEqual([]);
     expect(await sameRealPath(sharedLink, ownerASkill)).toBe(true);

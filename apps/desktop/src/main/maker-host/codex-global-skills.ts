@@ -36,6 +36,11 @@ export interface CodexGlobalSkillsPrepareResult {
   codexHome: string;
   skillsDir: string;
   changed: boolean;
+  /**
+   * 当前实际发布的 agents 内容寻址投影；undefined 表示本轮无法安全确认，null 表示来源缺失。
+   * 每个进程据此感知由其他进程完成、因而本轮没有本地写盘的投影切换。
+   */
+  agentsProjectionIdentity: string | null | undefined;
   sources: CodexGlobalSkillSourceResult[];
   warnings: string[];
 }
@@ -298,14 +303,19 @@ async function collectOwnerVisibleAgentSkills(
 
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
     const sourcePath = path.join(sharedSkillsDir, entry.name);
+    // 网络盘或特殊文件系统可能把 readdir 的 d_type 报成 unknown；安全边界必须以
+    // lstat 的真实条目类型为准，不能让受管 Ghost symlink 被误当成普通目录。
+    const sourceStat = await fsp.lstat(sourcePath).catch(() => null);
+    if (!sourceStat) continue;
+    const isSymbolicLink = sourceStat.isSymbolicLink();
     const target = await realPathOrNull(sourcePath);
     if (!target || !(await isDirectory(sourcePath))) continue;
 
-    const lexicalTarget = entry.isSymbolicLink()
+    const lexicalTarget = isSymbolicLink
       ? await lexicalManagedLinkTarget(path.join(sourcePath, 'SKILL.md'), entry.name)
       : null;
     const isGhostLink =
-      entry.isSymbolicLink() &&
+      isSymbolicLink &&
       (targetLooksGhostManaged(target, entry.name, sharedLegacyGhostRoots) ||
         Boolean(
           lexicalTarget &&
@@ -448,6 +458,7 @@ export async function prepareCodexGlobalSkillsLinks(
 
   const warnings: string[] = [];
   let changed = false;
+  let agentsProjectionIdentity: string | null | undefined;
   await cleanupLegacyAggregate(paths.codexHome);
 
   const skillsDirReal = await realPathOrNull(paths.skillsDir);
@@ -461,6 +472,7 @@ export async function prepareCodexGlobalSkillsLinks(
     if (!(await isDirectory(sourceDef.source))) {
       opts.assertOwnerStable?.();
       changed = (await removeManagedLink(sourceDef.link)) || changed;
+      if (sourceDef.name === 'agents') agentsProjectionIdentity = null;
       sources.push({ ...sourceDef, status: 'missing', reason: 'source directory does not exist' });
       continue;
     }
@@ -495,6 +507,7 @@ export async function prepareCodexGlobalSkillsLinks(
       );
     }
     if (sourceDef.name === 'agents' && (result.status === 'linked' || result.status === 'kept')) {
+      agentsProjectionIdentity = path.basename(linkTarget);
       await cleanupStaleAgentsProjections(
         paths.codexHome,
         linkTarget,
@@ -510,6 +523,7 @@ export async function prepareCodexGlobalSkillsLinks(
     codexHome: paths.codexHome,
     skillsDir: paths.skillsDir,
     changed,
+    agentsProjectionIdentity,
     sources,
     warnings,
   };
