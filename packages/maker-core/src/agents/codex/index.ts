@@ -4037,8 +4037,8 @@ export class CodexAgent extends BaseAgent {
         `Cindy capability routing requires Codex app-server 0.145.0 or newer (current: ${initResp.userAgent ?? 'unknown'})`,
       );
     }
-    // Slash 分派必须与 thread/start 使用同一份冻结策略，不能重新扫描后绕过
-    // owner 隔离或能力兼容禁用。发送热路径只做 Set 查询，不增加 I/O。
+    // 能力兼容禁用随 thread/start 冻结；本地 owner 隔离还会在 Slash 分派时
+    // 针对刚扫描到的列表复验，避免会话启动后出现的新路径绕过这份快照。
     const sessionDisabledSkillPaths = configuredDisabledSkillPaths(capabilityRoutingConfig);
     // Only the official OpenAI OAuth route uses Codex Guardian. Third-party,
     // gateway and custom-provider routes use the current session model through
@@ -4821,11 +4821,27 @@ export class CodexAgent extends BaseAgent {
       if (!slash) return toAppServerInput(content, opts.workingDir);
 
       try {
-        const { skills } = await this.listSkillsForCwd(opts.workingDir, false);
+        const { skills, errors } = await this.listSkillsForCwd(opts.workingDir, false);
+        const dispatchDisabledSkillPaths = new Set(sessionDisabledSkillPaths);
+        if (resolveHostDisabledSkillPaths) {
+          const discoveredSkills = [
+            ...skills,
+            ...errors.flatMap((error) =>
+              error.path ? [{ path: error.path, enabled: true }] : [],
+            ),
+          ];
+          const hostDisabledPaths = await resolveHostDisabledSkillPaths({
+            workingDir: opts.workingDir,
+            skills: discoveredSkills,
+          });
+          for (const skillPath of hostDisabledPaths) {
+            dispatchDisabledSkillPaths.add(skillPath);
+          }
+        }
         const skill = skills.find(
           (item) =>
             item.enabled &&
-            !sessionDisabledSkillPaths.has(item.path) &&
+            !dispatchDisabledSkillPaths.has(item.path) &&
             item.name.toLowerCase() === slash.name.toLowerCase(),
         );
         if (!skill) return toAppServerInput(content, opts.workingDir);

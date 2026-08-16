@@ -1080,6 +1080,69 @@ describe('CodexAgent capability routing', () => {
     await handle.close();
   });
 
+  it('revalidates host-disabled Skill paths before dispatching a leading Slash', async () => {
+    const foreignSkillPath =
+      '/profiles/a/owners/owner-a/cindy-brain/ghost-late/skills/late-profile/SKILL.md';
+    let skills: Array<{
+      name: string;
+      description: string;
+      path: string;
+      scope: 'user';
+      enabled: boolean;
+    }> = [];
+    const resolveCodexDisabledSkillPaths = vi.fn(async ({ skills: discoveredSkills }) =>
+      discoveredSkills
+        .map((skill) => skill.path)
+        .filter((skillPath) => skillPath === foreignSkillPath),
+    );
+    const agent = new CodexAgent(createDeps({}, { resolveCodexDisabledSkillPaths }));
+    const host = installFakeHost(
+      agent,
+      (method, params) => {
+        if (method !== Method.SkillsList) return undefined;
+        const { cwds = ['/repo'] } = params as { cwds?: string[] };
+        return { data: cwds.map((cwd) => ({ cwd, skills, errors: [] })) };
+      },
+      { userAgent: 'mock-codex/0.145.0' },
+    );
+
+    const handle = await agent.startSession({
+      sessionId: 'session-owner-filtered-late-skill',
+      model: 'gpt-5.4',
+      workingDir: '/repo',
+    });
+    skills = [
+      {
+        name: 'late-profile',
+        description: 'Profile A Skill discovered after the session started',
+        path: foreignSkillPath,
+        scope: 'user',
+        enabled: true,
+      },
+    ];
+
+    expect((await agent.listAgentSkills({ workingDir: '/repo', forceReload: true })).skills).toEqual(
+      [],
+    );
+    await handle.send({
+      type: 'user',
+      content: '/late-profile should stay literal',
+    });
+
+    const turnStart = host.request.mock.calls.find(
+      ([method]) => method === Method.TurnStart,
+    )?.[1] as { input?: unknown };
+    expect(turnStart.input).toEqual([
+      { type: 'text', text: '/late-profile should stay literal' },
+    ]);
+    expect(resolveCodexDisabledSkillPaths).toHaveBeenLastCalledWith({
+      workingDir: '/repo',
+      skills,
+    });
+
+    await handle.close();
+  });
+
   it('fails closed for host-disabled Skill paths reported only as catalog errors', async () => {
     const brokenForeignSkillPath =
       '/profiles/a/owners/owner-a/cindy-brain/ghost-a/agent-skills/profile-a/SKILL.md';
