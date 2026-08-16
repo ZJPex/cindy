@@ -1144,6 +1144,7 @@ export function CustomProviderDialog({
             id: m.id.trim(),
             name: m.name.trim(),
             ...(agent === 'pi' && m.piApi ? { piApi: m.piApi } : {}),
+            ...(m.route ? { route: { ...m.route } } : {}),
             ...(m.contextWindow !== undefined ? { contextWindow: m.contextWindow } : {}),
             ...(m.defaultEnabled === false ? { defaultEnabled: false } : {}),
             ...(m.supportsImageInput === true ? { supportsImageInput: true } : {}),
@@ -1175,6 +1176,7 @@ export function CustomProviderDialog({
               id: m.id,
               name: cur?.name || m.name,
               ...(agent === 'pi' && cur?.piApi ? { piApi: cur.piApi } : {}),
+              ...(cur?.route ? { route: { ...cur.route } } : {}),
               ...(contextWindow !== undefined ? { contextWindow } : {}),
               ...(cur?.defaultEnabled === false ? { defaultEnabled: false } : {}),
               ...(cur?.supportsImageInput === true ? { supportsImageInput: true } : {}),
@@ -1253,6 +1255,9 @@ export function CustomProviderDialog({
         id: m.id,
         name: latest?.name.trim() ? latest.name.trim() : m.name,
         ...(picker.agent === 'pi' && piApi ? { piApi } : {}),
+        ...(latest?.route ?? m.route
+          ? { route: { ...(latest?.route ?? m.route)! } }
+          : {}),
         ...(contextWindow !== undefined ? { contextWindow } : {}),
         ...(defaultEnabled === false ? { defaultEnabled: false } : {}),
         ...(supportsImageInput === true ? { supportsImageInput: true } : {}),
@@ -1272,6 +1277,7 @@ export function CustomProviderDialog({
           id,
           name: m.name.trim() || id,
           ...(picker.agent === 'pi' && m.piApi ? { piApi: m.piApi } : {}),
+          ...(m.route ? { route: { ...m.route } } : {}),
           ...(m.contextWindow !== undefined ? { contextWindow: m.contextWindow } : {}),
           ...(m.defaultEnabled === false ? { defaultEnabled: false } : {}),
           ...(m.supportsImageInput === true ? { supportsImageInput: true } : {}),
@@ -1407,6 +1413,7 @@ export function CustomProviderDialog({
           id: m.id.trim(),
           name: m.name.trim(),
           ...(a === 'pi' && m.piApi ? { piApi: m.piApi } : {}),
+          ...(m.route ? { route: { ...m.route } } : {}),
           ...(m.contextWindow !== undefined ? { contextWindow: m.contextWindow } : {}),
           ...(m.defaultEnabled === false ? { defaultEnabled: false } : {}),
           ...(m.supportsImageInput === true ? { supportsImageInput: true } : {}),
@@ -1609,6 +1616,7 @@ export function CustomProviderDialog({
   return (
     <div
       ref={dialogScrimRef}
+      data-custom-provider-dialog-scrim="true"
       className="fixed inset-0 z-[10000] flex items-center justify-center bg-[var(--overlay-modal)]"
       onPointerDown={(event) => {
         // pointerdown 时先按当前层级结算，避免 Popover 的 outside-dismiss 在随后
