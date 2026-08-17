@@ -786,13 +786,15 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
   private lastKnownCodexCredentialScope: AuthState['credentialScope'] = undefined;
 
   /**
-   * 进行中的 ensureGlobalCodexAssets 调用。同一 owner 复用一次准备；owner 切换时将新准备
-   * 串在旧准备之后，避免两个 Profile 并发改写同一个 CODEX_HOME 投影。结束后不长期缓存，
-   * 因为源文件 (~/.codex/AGENTS.md) 随时可能被用户修改。
+   * 进行中的 ensureGlobalCodexAssets 调用。同一 owner 的后续刷新在准备已开始时合并为一次
+   * 尾随重跑；owner 切换时将新准备串在旧准备之后，避免两个 Profile 并发改写同一个
+   * CODEX_HOME 投影。结束后不长期缓存，因为源文件 (~/.codex/AGENTS.md) 随时可能被用户修改。
    */
   private pendingAssetsPrep: {
     owner: CodexAssetPrepOwnerCapture;
     promise: Promise<{ skillsProjectionEpoch: number }>;
+    runStarted: boolean;
+    rerunRequested: boolean;
   } | null = null;
   /** 由 maker-host 装配 GhostManager 的批准态唯一入口；未装配时 Ghost 投影 fail-closed。 */
   private approvedGhostSkillSourceProvider?: () => CodexApprovedGhostSkillSource;
@@ -1101,16 +1103,44 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
   async ensureGlobalCodexAssets(): Promise<{ skillsProjectionEpoch: number }> {
     const owner = captureCodexAssetPrepOwner();
     const current = this.pendingAssetsPrep;
-    if (current?.owner.ownerScopeKey === owner.ownerScopeKey) return current.promise;
+    if (current?.owner.ownerScopeKey === owner.ownerScopeKey) {
+      // 已开始的准备可能已经读取过批准快照；把后续刷新收敛成一次尾随重跑。
+      // 若任务仍在等待前一个 owner，则首次执行尚未取快照，无需额外再跑一轮。
+      if (current.runStarted) current.rerunRequested = true;
+      return current.promise;
+    }
 
-    const start = current
-      ? current.promise.catch(() => undefined).then(() => this.runEnsureGlobalCodexAssets(owner))
-      : this.runEnsureGlobalCodexAssets(owner);
     const pending: {
       owner: CodexAssetPrepOwnerCapture;
       promise: Promise<{ skillsProjectionEpoch: number }>;
-    } = { owner, promise: start };
-    pending.promise = start.finally(() => {
+      runStarted: boolean;
+      rerunRequested: boolean;
+    } = {
+      owner,
+      promise: Promise.resolve({ skillsProjectionEpoch: this.skillsProjectionEpoch }),
+      runStarted: false,
+      rerunRequested: false,
+    };
+    const start = async (): Promise<{ skillsProjectionEpoch: number }> => {
+      if (current) await current.promise.catch(() => undefined);
+
+      let outcome:
+        | { ok: true; value: { skillsProjectionEpoch: number } }
+        | { ok: false; error: unknown };
+      do {
+        pending.rerunRequested = false;
+        pending.runStarted = true;
+        try {
+          outcome = { ok: true, value: await this.runEnsureGlobalCodexAssets(owner) };
+        } catch (error) {
+          outcome = { ok: false, error };
+        }
+      } while (pending.rerunRequested && this.pendingAssetsPrep === pending);
+
+      if (outcome.ok) return outcome.value;
+      throw outcome.error;
+    };
+    pending.promise = start().finally(() => {
       if (this.pendingAssetsPrep === pending) this.pendingAssetsPrep = null;
     });
     this.pendingAssetsPrep = pending;

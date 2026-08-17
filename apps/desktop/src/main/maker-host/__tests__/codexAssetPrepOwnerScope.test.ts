@@ -256,6 +256,61 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
     },
   );
 
+  it('runs one trailing preparation when the same owner refreshes during an active run', async () => {
+    const { DesktopCodexAuthAdapter } = await import('../auth-adapters.js');
+    const adapter = Object.create(DesktopCodexAuthAdapter.prototype) as InstanceType<
+      typeof DesktopCodexAuthAdapter
+    >;
+    let finishFirstRun!: () => void;
+    let finishTrailingRun!: () => void;
+    const firstRun = new Promise<void>((resolve) => {
+      finishFirstRun = resolve;
+    });
+    const trailingRun = new Promise<void>((resolve) => {
+      finishTrailingRun = resolve;
+    });
+    const runEnsureGlobalCodexAssets = vi
+      .fn<
+        (owner: {
+          ownerId: string | null;
+          ownerRoot: string;
+          ownerScopeKey: string;
+        }) => Promise<{ skillsProjectionEpoch: number }>
+      >()
+      .mockImplementationOnce(async () => {
+        await firstRun;
+        return { skillsProjectionEpoch: 1 };
+      })
+      .mockImplementationOnce(async () => {
+        await trailingRun;
+        return { skillsProjectionEpoch: 2 };
+      });
+    Object.defineProperties(adapter, {
+      pendingAssetsPrep: { configurable: true, writable: true, value: null },
+      runEnsureGlobalCodexAssets: {
+        configurable: true,
+        value: runEnsureGlobalCodexAssets,
+      },
+    });
+
+    const first = adapter.ensureGlobalCodexAssets();
+    await vi.waitFor(() => expect(runEnsureGlobalCodexAssets).toHaveBeenCalledTimes(1));
+
+    const refresh = adapter.ensureGlobalCodexAssets();
+    const anotherRefresh = adapter.ensureGlobalCodexAssets();
+    expect(runEnsureGlobalCodexAssets).toHaveBeenCalledTimes(1);
+
+    finishFirstRun();
+    await vi.waitFor(() => expect(runEnsureGlobalCodexAssets).toHaveBeenCalledTimes(2));
+
+    finishTrailingRun();
+    await expect(Promise.all([first, refresh, anotherRefresh])).resolves.toEqual([
+      { skillsProjectionEpoch: 2 },
+      { skillsProjectionEpoch: 2 },
+      { skillsProjectionEpoch: 2 },
+    ]);
+  });
+
   it('rejects a queued owner capture after a later Profile becomes active', async () => {
     const { DesktopCodexAuthAdapter } = await import('../auth-adapters.js');
     const adapter = Object.create(DesktopCodexAuthAdapter.prototype) as InstanceType<
