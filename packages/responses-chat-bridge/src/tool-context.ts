@@ -17,9 +17,13 @@ const CUSTOM_TOOL_INPUT_DESCRIPTION =
 const CUSTOM_EXEC_DESCRIPTION_MAX_BYTES = 32 * 1024;
 const COMPACT_CUSTOM_EXEC_DESCRIPTION = [
   'Execute JavaScript in the Code Mode runtime. Pass the complete JavaScript source in `input`.',
-  'Await nested calls exposed on the global `tools` object, and inspect `ALL_TOOLS` for the',
-  'available tool names and descriptions, including shell, patch, plugin, connector, and MCP',
-  'tools. Return user-visible values with `text(...)` or the matching media helper.',
+  'Call nested tools on the global `tools` object with `await tools.<name>(...)` or',
+  '`await tools.<namespace>.<name>(...)`,',
+  'and inspect `ALL_TOOLS` for available shell, patch, plugin, connector, and MCP tools.',
+  'Use `yield_control()` to yield while execution continues, and `exit()` to stop early.',
+  'Return user-visible output with `text(...)`, `image(...)`, `audio(...)`, or',
+  '`generatedImage(...)`. Share serializable state across exec calls with `store(key, value)`',
+  'and `load(key)`, and report progress with `notify(value)`.',
 ].join(' ');
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

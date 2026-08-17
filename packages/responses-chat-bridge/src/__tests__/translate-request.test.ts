@@ -925,6 +925,21 @@ describe('translateResponsesRequest', () => {
     expect(execTool?.description).not.toContain('EXEC_CATALOG_START');
     expect(execTool?.description).toContain('global `tools`');
     expect(execTool?.description).toContain('`ALL_TOOLS`');
+    for (const protocol of [
+      '`await tools.<name>(...)`',
+      '`await tools.<namespace>.<name>(...)`',
+      '`yield_control()`',
+      '`exit()`',
+      '`text(...)`',
+      '`image(...)`',
+      '`audio(...)`',
+      '`generatedImage(...)`',
+      '`store(key, value)`',
+      '`load(key)`',
+      '`notify(value)`',
+    ]) {
+      expect(execTool?.description).toContain(protocol);
+    }
     expect(Buffer.byteLength(JSON.stringify(out.tools?.[0]), 'utf8')).toBeLessThan(4_096);
     expect(out.tool_choice).toEqual({ type: 'function', function: { name: 'exec' } });
 
