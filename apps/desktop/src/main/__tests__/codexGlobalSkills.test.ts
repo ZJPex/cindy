@@ -268,8 +268,8 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     const homeDir = path.join(root, 'home');
     const codexHome = path.join(root, 'xdt-codex-home');
     const agentsSkills = path.join(homeDir, '.agents', 'skills');
-    const ownerARoot = path.join(root, 'user-data-a', 'owners', 'owner-a');
-    const ownerBRoot = path.join(root, 'user-data-b', 'owners', 'owner-b');
+    const ownerARoot = path.join(root, 'user-data', 'owners', 'owner-a');
+    const ownerBRoot = path.join(root, 'user-data', 'owners', 'owner-b');
     const ownerASkill = await writeInstalledGhostSkill(ownerARoot, 'ghost-a', {
       dir: 'skills/profile-a',
       name: 'profile-a',
@@ -317,6 +317,42 @@ describe('prepareCodexGlobalSkillsLinks', () => {
       'skill-snapshots',
       'acme',
       'revision',
+      'deploy',
+    );
+    const ordinaryLink = path.join(agentsSkills, 'acme--deploy');
+    await writeSkill(path.dirname(ordinarySkill), path.basename(ordinarySkill));
+    await linkDirectory(ordinarySkill, ordinaryLink);
+
+    await expect(
+      codexDisabledSkillPathsForOwner([{ path: path.join(ordinaryLink, 'SKILL.md') }], {
+        ownerRoot,
+      }),
+    ).resolves.toEqual([]);
+
+    const result = await prepareCodexGlobalSkillsLinks(codexHome, {
+      homeDir,
+      ownerRoot,
+    });
+    const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+    expect(result.warnings).toEqual([]);
+    expect(
+      await sameRealPath(path.join(paths.sharedAgentsSkillsLink, 'acme--deploy'), ordinarySkill),
+    ).toBe(true);
+  });
+
+  it('keeps ordinary global Skills that mimic an owner-scoped legacy path outside Cindy owners root', async () => {
+    const root = await makeTmpDir();
+    const homeDir = path.join(root, 'home');
+    const codexHome = path.join(root, 'xdt-codex-home');
+    const agentsSkills = path.join(homeDir, '.agents', 'skills');
+    const ownerRoot = path.join(root, 'user-data', 'owners', 'owner-a');
+    const ordinarySkill = path.join(
+      root,
+      'work',
+      'owners',
+      'vendor',
+      'cindy-brain',
+      'acme',
       'deploy',
     );
     const ordinaryLink = path.join(agentsSkills, 'acme--deploy');
@@ -400,8 +436,8 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     const root = await makeTmpDir();
     const misleadingHome = path.join(root, 'home--not-a-ghost-link');
     const agentsSkills = path.join(misleadingHome, '.agents', 'skills');
-    const ownerARoot = path.join(root, 'user-data-a', 'owners', 'owner-a');
-    const ownerBRoot = path.join(root, 'user-data-b', 'owners', 'owner-b');
+    const ownerARoot = path.join(root, 'user-data', 'owners', 'owner-a');
+    const ownerBRoot = path.join(root, 'user-data', 'owners', 'owner-b');
     const ownerASkill = path.join(
       ownerARoot,
       'cindy-brain',

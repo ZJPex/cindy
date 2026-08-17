@@ -111,13 +111,18 @@ function targetLooksGhostRepositoryManaged(
   sharedLegacyGhostRoots: readonly string[] = [],
 ): boolean {
   const expectedGhostId = ghostIdFromLinkName(linkName);
-  const segments = target.split(/[\\/]/).map((segment) => segment.toLowerCase());
+  const normalizedTarget = normalizeForCompare(target);
+  const segments = normalizedTarget.split(/[\\/]/).map((segment) => segment.toLowerCase());
   const ownerScoped = segments.some((segment, index) => {
     // owner-scoped 旧安装目录只用于识别并隔离遗留链接，绝不再作为允许列表来源。
     if (segment !== 'cindy-brain' && segment !== 'brain') return false;
     if (segments[index - 2] !== 'owners' || !segments[index - 1]) return false;
     const actualGhostId = segments[index + 1];
-    return Boolean(actualGhostId) && (!expectedGhostId || actualGhostId === expectedGhostId);
+    if (!actualGhostId || (expectedGhostId !== null && actualGhostId !== expectedGhostId)) {
+      return false;
+    }
+    // owner 缺失时维持 fail-closed；有 owner 时只承认 Cindy 实际 owners 根内的旧目录。
+    return ownersRoot === null || isSameOrInside(normalizedTarget, ownersRoot);
   });
   const approvedSnapshot = segments.some((segment, index) => {
     if (segment !== 'ghost-install-state') return false;
@@ -133,7 +138,7 @@ function targetLooksGhostRepositoryManaged(
       return false;
     }
     // owner 缺失时维持 fail-closed；有 owner 时只承认 Cindy 实际 owners 根内的快照。
-    return ownersRoot === null || isSameOrInside(normalizeForCompare(target), ownersRoot);
+    return ownersRoot === null || isSameOrInside(normalizedTarget, ownersRoot);
   });
   return (
     ownerScoped ||
