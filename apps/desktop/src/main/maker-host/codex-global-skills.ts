@@ -73,11 +73,16 @@ function ghostIdFromLinkName(linkName: string | undefined): string | null {
   return separator > 0 ? linkName.slice(0, separator).toLowerCase() : null;
 }
 
-function sharedLegacyGhostRootsForOwnerRoot(ownerRoot: string | undefined): string[] {
-  if (!ownerRoot) return [];
+function ownersRootForOwnerRoot(ownerRoot: string | undefined): string | null {
+  if (!ownerRoot) return null;
   const normalizedOwnerRoot = normalizeForCompare(ownerRoot);
   const ownersRoot = path.dirname(normalizedOwnerRoot);
-  if (path.basename(ownersRoot).toLowerCase() !== 'owners') return [];
+  return path.basename(ownersRoot).toLowerCase() === 'owners' ? ownersRoot : null;
+}
+
+function sharedLegacyGhostRootsForOwnerRoot(ownerRoot: string | undefined): string[] {
+  const ownersRoot = ownersRootForOwnerRoot(ownerRoot);
+  if (!ownersRoot) return [];
   const userDataRoot = path.dirname(ownersRoot);
   return ['cindy-brain', 'brain'].map((name) => normalizeForCompare(path.join(userDataRoot, name)));
 }
@@ -102,32 +107,37 @@ function targetLooksSharedLegacyGhostManaged(
 function targetLooksGhostRepositoryManaged(
   target: string,
   linkName?: string,
+  ownersRoot: string | null = null,
   sharedLegacyGhostRoots: readonly string[] = [],
 ): boolean {
-  const segments = target.split(/[\\/]/).map((segment) => segment.toLowerCase());
   const expectedGhostId = ghostIdFromLinkName(linkName);
-  const ownerScopedOrApproved = segments.some((segment, index) => {
+  const segments = target.split(/[\\/]/).map((segment) => segment.toLowerCase());
+  const ownerScoped = segments.some((segment, index) => {
     // owner-scoped 旧安装目录只用于识别并隔离遗留链接，绝不再作为允许列表来源。
-    if (segment === 'cindy-brain' || segment === 'brain') {
-      if (segments[index - 2] !== 'owners' || !segments[index - 1]) return false;
-      const actualGhostId = segments[index + 1];
-      return Boolean(actualGhostId) && (!expectedGhostId || actualGhostId === expectedGhostId);
-    }
-    // 当前受管链接指向 receipt-backed 批准快照：
-    // owners/<owner>/ghost-install-state/skill-snapshots/<id>/<revision>/...
+    if (segment !== 'cindy-brain' && segment !== 'brain') return false;
+    if (segments[index - 2] !== 'owners' || !segments[index - 1]) return false;
+    const actualGhostId = segments[index + 1];
+    return Boolean(actualGhostId) && (!expectedGhostId || actualGhostId === expectedGhostId);
+  });
+  const approvedSnapshot = segments.some((segment, index) => {
     if (segment !== 'ghost-install-state') return false;
     if (segments[index - 2] !== 'owners' || !segments[index - 1]) return false;
     if (segments[index + 1] !== 'skill-snapshots') return false;
     const actualGhostId = segments[index + 2];
     const revision = segments[index + 3];
-    return (
-      Boolean(actualGhostId) &&
-      Boolean(revision) &&
-      (!expectedGhostId || actualGhostId === expectedGhostId)
-    );
+    if (
+      !actualGhostId ||
+      !revision ||
+      (expectedGhostId !== null && actualGhostId !== expectedGhostId)
+    ) {
+      return false;
+    }
+    // owner 缺失时维持 fail-closed；有 owner 时只承认 Cindy 实际 owners 根内的快照。
+    return ownersRoot === null || isSameOrInside(normalizeForCompare(target), ownersRoot);
   });
   return (
-    ownerScopedOrApproved ||
+    ownerScoped ||
+    approvedSnapshot ||
     targetLooksSharedLegacyGhostManaged(target, linkName, sharedLegacyGhostRoots)
   );
 }
@@ -135,13 +145,14 @@ function targetLooksGhostRepositoryManaged(
 function targetLooksGhostManaged(
   target: string,
   linkName: string,
+  ownersRoot: string | null,
   sharedLegacyGhostRoots: readonly string[],
 ): boolean {
   // 与 skillSlot 使用同一归属思路：链接名提供 ghost id，目标只需落在
   // cindy-brain/<id> 或 legacy brain/<id> 下，不假设插件内部一定使用 skills/。
   return (
     ghostIdFromLinkName(linkName) !== null &&
-    targetLooksGhostRepositoryManaged(target, linkName, sharedLegacyGhostRoots)
+    targetLooksGhostRepositoryManaged(target, linkName, ownersRoot, sharedLegacyGhostRoots)
   );
 }
 
@@ -253,6 +264,7 @@ export async function codexDisabledSkillPathsForOwner(
   opts: OwnerGhostOptions = {},
 ): Promise<string[]> {
   opts.assertOwnerStable?.();
+  const ownersRoot = ownersRootForOwnerRoot(opts.ownerRoot);
   const sharedLegacyGhostRoots = sharedLegacyGhostRootsForOwnerRoot(opts.ownerRoot);
   const allowedByLinkName = new Map<string, string>();
   const allowedTargets = new Set<string>();
@@ -272,10 +284,15 @@ export async function codexDisabledSkillPathsForOwner(
     const lexicalTarget = await lexicalManagedLinkTarget(skill.path, linkName);
     opts.assertOwnerStable?.();
     if (
-      !targetLooksGhostRepositoryManaged(target, linkName, sharedLegacyGhostRoots) &&
+      !targetLooksGhostRepositoryManaged(target, linkName, ownersRoot, sharedLegacyGhostRoots) &&
       !(
         lexicalTarget &&
-        targetLooksGhostRepositoryManaged(lexicalTarget, linkName, sharedLegacyGhostRoots)
+        targetLooksGhostRepositoryManaged(
+          lexicalTarget,
+          linkName,
+          ownersRoot,
+          sharedLegacyGhostRoots,
+        )
       )
     ) {
       continue;
@@ -299,6 +316,7 @@ async function collectOwnerVisibleAgentSkills(
 ): Promise<ProjectionEntry[]> {
   const entries = await fsp.readdir(sharedSkillsDir, { withFileTypes: true });
   const visible = new Map<string, ProjectionEntry>();
+  const ownersRoot = ownersRootForOwnerRoot(opts.ownerRoot);
   const sharedLegacyGhostRoots = sharedLegacyGhostRootsForOwnerRoot(opts.ownerRoot);
 
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
@@ -316,10 +334,10 @@ async function collectOwnerVisibleAgentSkills(
       : null;
     const isGhostLink =
       isSymbolicLink &&
-      (targetLooksGhostManaged(target, entry.name, sharedLegacyGhostRoots) ||
+      (targetLooksGhostManaged(target, entry.name, ownersRoot, sharedLegacyGhostRoots) ||
         Boolean(
           lexicalTarget &&
-          targetLooksGhostManaged(lexicalTarget, entry.name, sharedLegacyGhostRoots),
+          targetLooksGhostManaged(lexicalTarget, entry.name, ownersRoot, sharedLegacyGhostRoots),
         ));
     // 受管 Ghost 链接不能从共享根直接进入投影：它们必须在下方从当前运行时仓库根
     // 重新收集，并通过 manifest 与受限 SKILL.md 的一致性校验。

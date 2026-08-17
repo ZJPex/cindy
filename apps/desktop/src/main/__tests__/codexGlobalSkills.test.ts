@@ -130,8 +130,8 @@ describe('prepareCodexGlobalSkillsLinks', () => {
   it('disables foreign Ghost paths reported through Codex native global discovery', async () => {
     const root = await makeTmpDir();
     const agentsSkills = path.join(root, 'home', '.agents', 'skills');
-    const ownerARoot = path.join(root, 'user-data-a', 'owners', 'owner-a');
-    const ownerBRoot = path.join(root, 'user-data-b', 'owners', 'owner-b');
+    const ownerARoot = path.join(root, 'user-data', 'owners', 'owner-a');
+    const ownerBRoot = path.join(root, 'user-data', 'owners', 'owner-b');
     const ownerAApproved = await writeApprovedGhostSkills(ownerARoot, 'ghost-a', [
       { dir: 'skills/profile-a', name: 'profile-a' },
     ]);
@@ -302,13 +302,51 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     ).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('keeps ordinary global Skills that mimic an approval snapshot outside Cindy owners root', async () => {
+    const root = await makeTmpDir();
+    const homeDir = path.join(root, 'home');
+    const codexHome = path.join(root, 'xdt-codex-home');
+    const agentsSkills = path.join(homeDir, '.agents', 'skills');
+    const ownerRoot = path.join(root, 'user-data', 'owners', 'owner-a');
+    const ordinarySkill = path.join(
+      root,
+      'work',
+      'owners',
+      'vendor',
+      'ghost-install-state',
+      'skill-snapshots',
+      'acme',
+      'revision',
+      'deploy',
+    );
+    const ordinaryLink = path.join(agentsSkills, 'acme--deploy');
+    await writeSkill(path.dirname(ordinarySkill), path.basename(ordinarySkill));
+    await linkDirectory(ordinarySkill, ordinaryLink);
+
+    await expect(
+      codexDisabledSkillPathsForOwner([{ path: path.join(ordinaryLink, 'SKILL.md') }], {
+        ownerRoot,
+      }),
+    ).resolves.toEqual([]);
+
+    const result = await prepareCodexGlobalSkillsLinks(codexHome, {
+      homeDir,
+      ownerRoot,
+    });
+    const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+    expect(result.warnings).toEqual([]);
+    expect(
+      await sameRealPath(path.join(paths.sharedAgentsSkillsLink, 'acme--deploy'), ordinarySkill),
+    ).toBe(true);
+  });
+
   it('keeps owner isolation for receipt-backed approval-snapshot links', async () => {
     const root = await makeTmpDir();
     const homeDir = path.join(root, 'home');
     const codexHome = path.join(root, 'xdt-codex-home');
     const agentsSkills = path.join(homeDir, '.agents', 'skills');
-    const ownerARoot = path.join(root, 'user-data-a', 'owners', 'owner-a');
-    const ownerBRoot = path.join(root, 'user-data-b', 'owners', 'owner-b');
+    const ownerARoot = path.join(root, 'user-data', 'owners', 'owner-a');
+    const ownerBRoot = path.join(root, 'user-data', 'owners', 'owner-b');
     const ownerAApproved = await writeApprovedGhostSkills(ownerARoot, 'ghost-a', [
       { dir: 'agent-skills/profile-a', name: 'profile-a' },
     ]);
@@ -465,8 +503,8 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     const homeDir = path.join(root, 'home');
     const codexHome = path.join(root, 'xdt-codex-home');
     const agentsSkills = path.join(homeDir, '.agents', 'skills');
-    const ownerARoot = path.join(root, 'user-data-a', 'owners', 'owner-a');
-    const ownerBRoot = path.join(root, 'user-data-b', 'owners', 'owner-b');
+    const ownerARoot = path.join(root, 'user-data', 'owners', 'owner-a');
+    const ownerBRoot = path.join(root, 'user-data', 'owners', 'owner-b');
     const ownerAApproved = await writeApprovedGhostSkills(ownerARoot, 'ghost-a', [
       { dir: 'skills/profile-a', name: 'profile-a' },
     ]);
@@ -613,8 +651,8 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     const homeDir = path.join(root, 'home');
     const codexHome = path.join(root, 'xdt-codex-home');
     const agentsSkills = path.join(homeDir, '.agents', 'skills');
-    const ownerARoot = path.join(root, 'user-data-a', 'owners', 'owner-a');
-    const ownerBRoot = path.join(root, 'user-data-b', 'owners', 'owner-b');
+    const ownerARoot = path.join(root, 'user-data', 'owners', 'owner-a');
+    const ownerBRoot = path.join(root, 'user-data', 'owners', 'owner-b');
     const item = { dir: 'agent-skills/shared', name: 'shared' };
     const ownerAApproved = await writeApprovedGhostSkills(ownerARoot, 'same-ghost', [item]);
     const ownerBApproved = await writeApprovedGhostSkills(ownerBRoot, 'same-ghost', [item]);
