@@ -17,9 +17,9 @@ const CUSTOM_TOOL_INPUT_DESCRIPTION =
 const CUSTOM_EXEC_DESCRIPTION_MAX_BYTES = 32 * 1024;
 const COMPACT_CUSTOM_EXEC_DESCRIPTION = [
   'Execute JavaScript in the Code Mode runtime. Pass the complete JavaScript source in `input`.',
-  'Call nested tools on the global `tools` object with `await tools.<name>(...)` or',
-  '`await tools.<namespace>.<name>(...)`,',
-  'and inspect `ALL_TOOLS` for available shell, patch, plugin, connector, and MCP tools.',
+  'Call tools on the global `tools` object with `await tools.<name>(...)`; namespace tools use',
+  'the flattened `await tools.<namespace>__<name>(...)` form.',
+  'Inspect `ALL_TOOLS` for available shell, patch, plugin, connector, and MCP tools.',
   'Use `yield_control()` to yield while execution continues, and `exit()` to stop early.',
   'Return user-visible output with `text(...)`, `image(...)`, `audio(...)`, or',
   '`generatedImage(...)`. Share serializable state across exec calls with `store(key, value)`',
