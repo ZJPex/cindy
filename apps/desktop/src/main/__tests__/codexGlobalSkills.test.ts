@@ -626,6 +626,59 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     expect(repeated.changed).toBe(false);
   });
 
+  it('repairs a corrupted content-addressed projection and invalidates cached Skills', async () => {
+    const root = await makeTmpDir();
+    const homeDir = path.join(root, 'home');
+    const codexHome = path.join(root, 'xdt-codex-home');
+    const agentsSkills = path.join(homeDir, '.agents', 'skills');
+    const ownerRoot = path.join(root, 'user-data', 'owners', 'owner-a');
+    const approved = await writeApprovedGhostSkills(ownerRoot, 'ghost-a', [
+      { dir: 'skills/profile-a', name: 'profile-a' },
+    ]);
+    const approvedSkill = approved.skillDirs.get('profile-a')!;
+    const wrongTarget = path.join(root, 'wrong-target');
+    await writeSkill(agentsSkills, 'user-global');
+    await writeSkill(path.dirname(wrongTarget), path.basename(wrongTarget));
+
+    const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+    await prepareCodexGlobalSkillsLinks(codexHome, {
+      homeDir,
+      ownerRoot,
+      approvedGhostSkills: approvedGhostSkills([approved.ghost]),
+    });
+    const projectionDir = await fs.realpath(paths.sharedAgentsSkillsLink);
+
+    await fs.rm(path.join(projectionDir, 'ghost-a--profile-a'), {
+      recursive: true,
+      force: true,
+    });
+    await fs.rm(path.join(projectionDir, 'user-global'), { recursive: true, force: true });
+    await linkDirectory(wrongTarget, path.join(projectionDir, 'user-global'));
+    await fs.mkdir(path.join(projectionDir, 'unexpected'));
+
+    const repaired = await prepareCodexGlobalSkillsLinks(codexHome, {
+      homeDir,
+      ownerRoot,
+      approvedGhostSkills: approvedGhostSkills([approved.ghost]),
+    });
+
+    expect(repaired.warnings).toEqual([]);
+    expect(repaired.changed).toBe(true);
+    expect(await fs.realpath(paths.sharedAgentsSkillsLink)).toBe(projectionDir);
+    expect(
+      await sameRealPath(path.join(projectionDir, 'ghost-a--profile-a'), approvedSkill),
+    ).toBe(true);
+    expect(
+      await sameRealPath(
+        path.join(projectionDir, 'user-global'),
+        path.join(agentsSkills, 'user-global'),
+      ),
+    ).toBe(true);
+    await expect(fs.lstat(path.join(projectionDir, 'unexpected'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
   it('rebuilds the projection when a new approved revision adds a Ghost Skill', async () => {
     const root = await makeTmpDir();
     const homeDir = path.join(root, 'home');

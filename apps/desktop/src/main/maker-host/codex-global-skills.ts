@@ -67,6 +67,11 @@ interface ProjectionEntry {
   target: string;
 }
 
+interface AgentsProjectionResult {
+  dir: string;
+  changed: boolean;
+}
+
 function ghostIdFromLinkName(linkName: string | undefined): string | null {
   if (!linkName) return null;
   const separator = linkName.lastIndexOf('--');
@@ -366,15 +371,59 @@ function projectionSignature(entries: ProjectionEntry[]): string {
   return hash.digest('hex').slice(0, 20);
 }
 
+async function agentsProjectionMatches(
+  projectionDir: string,
+  entries: readonly ProjectionEntry[],
+): Promise<boolean> {
+  const projectionStat = await fsp.lstat(projectionDir).catch(() => null);
+  if (!projectionStat?.isDirectory() || projectionStat.isSymbolicLink()) return false;
+
+  const actualNames = await fsp.readdir(projectionDir).catch(() => null);
+  if (!actualNames || actualNames.length !== entries.length) return false;
+  const expectedNames = new Set(entries.map((entry) => entry.name));
+  if (actualNames.some((name) => !expectedNames.has(name))) return false;
+
+  for (const entry of entries) {
+    const linkPath = path.join(projectionDir, entry.name);
+    const linkStat = await fsp.lstat(linkPath).catch(() => null);
+    if (!linkStat?.isSymbolicLink()) return false;
+    if ((await realPathOrNull(linkPath)) !== normalizeForCompare(entry.target)) return false;
+  }
+  return true;
+}
+
+function sameFsIdentity(
+  left: Pick<import('node:fs').BigIntStats, 'dev' | 'ino'>,
+  right: Pick<import('node:fs').BigIntStats, 'dev' | 'ino'>,
+): boolean {
+  return left.dev !== 0n && left.ino !== 0n && left.dev === right.dev && left.ino === right.ino;
+}
+
+function hasFsIdentity(value: Pick<import('node:fs').BigIntStats, 'dev' | 'ino'>): boolean {
+  return value.dev !== 0n && value.ino !== 0n;
+}
+
+async function removeQuarantinedProjection(
+  quarantineDir: string,
+  expected: Pick<import('node:fs').BigIntStats, 'dev' | 'ino'>,
+): Promise<void> {
+  const current = await fsp.lstat(quarantineDir, { bigint: true }).catch(() => null);
+  // 无可信文件身份时保留隔离目录，不冒险递归删除并发进程替换后的路径。
+  if (!current || !sameFsIdentity(current, expected)) return;
+  await fsp.rm(quarantineDir, { recursive: true, force: true });
+}
+
 async function ensureAgentsProjection(
   codexHome: string,
   sharedSkillsDir: string,
   opts: OwnerGhostOptions,
-): Promise<string> {
+): Promise<AgentsProjectionResult> {
   const entries = await collectOwnerVisibleAgentSkills(sharedSkillsDir, opts);
   const projectionRoot = path.join(codexHome, 'skill-projections');
   const projectionDir = path.join(projectionRoot, `agents-${projectionSignature(entries)}`);
-  if (await isDirectory(projectionDir)) return projectionDir;
+  if (await agentsProjectionMatches(projectionDir, entries)) {
+    return { dir: projectionDir, changed: false };
+  }
 
   // 内容寻址目录 + 临时目录 rename，避免 Codex 扫到只建了一半的投影。
   opts.assertOwnerStable?.();
@@ -389,16 +438,53 @@ async function ensureAgentsProjection(
         throw new Error(`cannot project ${entry.name}: ${result.reason ?? result.status}`);
       }
     }
-    try {
+    if (!(await agentsProjectionMatches(stagingDir, entries))) {
+      throw new Error('staged agents projection does not match expected entries');
+    }
+
+    // 构建期间另一进程可能已经完成同一修复；接受前仍需验证完整内容。
+    if (await agentsProjectionMatches(projectionDir, entries)) {
+      return { dir: projectionDir, changed: false };
+    }
+
+    const existing = await fsp.lstat(projectionDir, { bigint: true }).catch(() => null);
+    if (!existing) {
       opts.assertOwnerStable?.();
       await fsp.rename(stagingDir, projectionDir);
-    } catch (err) {
-      if (!(await isDirectory(projectionDir))) throw err;
+    } else {
+      // 先把损坏目录移入本轮独占的隔离根，再发布完整 staging；删除隔离目录前用
+      // dev/ino 复核身份，避免递归删除并发进程换入的路径。
+      const quarantineRoot = await fsp.mkdtemp(path.join(projectionRoot, '.agents-corrupt-'));
+      const quarantineDir = path.join(quarantineRoot, 'projection');
+      opts.assertOwnerStable?.();
+      await fsp.rename(projectionDir, quarantineDir);
+      const moved = await fsp.lstat(quarantineDir, { bigint: true });
+      if (hasFsIdentity(existing) && hasFsIdentity(moved) && !sameFsIdentity(existing, moved)) {
+        throw new Error('agents projection identity changed during quarantine');
+      }
+      try {
+        opts.assertOwnerStable?.();
+        await fsp.rename(stagingDir, projectionDir);
+      } catch (err) {
+        const current = await fsp.lstat(projectionDir).catch(() => null);
+        if (!current) await fsp.rename(quarantineDir, projectionDir).catch(() => undefined);
+        throw err;
+      }
+      if (!(await agentsProjectionMatches(projectionDir, entries))) {
+        throw new Error('published agents projection does not match expected entries');
+      }
+      opts.assertOwnerStable?.();
+      await removeQuarantinedProjection(quarantineDir, moved);
+      await fsp.rmdir(quarantineRoot).catch(() => undefined);
+    }
+
+    if (!(await agentsProjectionMatches(projectionDir, entries))) {
+      throw new Error('published agents projection does not match expected entries');
     }
   } finally {
     await fsp.rm(stagingDir, { recursive: true, force: true });
   }
-  return projectionDir;
+  return { dir: projectionDir, changed: true };
 }
 
 async function cleanupStaleAgentsProjections(
@@ -509,7 +595,9 @@ export async function prepareCodexGlobalSkillsLinks(
     let linkTarget = sourceDef.source;
     if (sourceDef.name === 'agents') {
       try {
-        linkTarget = await ensureAgentsProjection(paths.codexHome, sourceDef.source, opts);
+        const projection = await ensureAgentsProjection(paths.codexHome, sourceDef.source, opts);
+        linkTarget = projection.dir;
+        changed = changed || projection.changed;
       } catch (err) {
         opts.assertOwnerStable?.();
         changed = (await removeManagedLink(sourceDef.link)) || changed;
