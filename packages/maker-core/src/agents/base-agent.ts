@@ -79,6 +79,7 @@ import type { PiRuntimeCapabilityManifest } from '../types/pi-runtime-capabiliti
 import type { PiProjectTrustInputSnapshot } from '../types/pi-project-trust.js';
 import { scanWorkspaceFileResources } from './shared/palette-scanner.js';
 import type { AutoReviewDelegate } from './shared/auto-review-decision.js';
+import type { ClaudeSubagentModelAccessResult } from './claude-code/subagent-model-access.js';
 
 export interface AgentCapabilityAdditions {
   /** Extra models exposed by the host for this agent. Existing built-in ids are ignored. */
@@ -467,6 +468,18 @@ export interface AgentDeps {
    */
   binaryPath: string;
   logger: Logger;
+
+  /**
+   * Claude Code 专用：按本次会话的当前 provider、账号与父模型实时判定显式
+   * Agent/Task 模型是否可路由。只有 `denied` 会形成产品硬阻断；目录未就绪、
+   * 非权威快照或读取失败必须返回 `unknown`，不能把静态 catalog 当权限清单。
+   */
+  resolveClaudeSubagentModelAccess?: (context: {
+    providerId?: string | null;
+    parentModel: string;
+    credentialMode?: AgentCredentialMode;
+    model: string;
+  }) => ClaudeSubagentModelAccessResult | Promise<ClaudeSubagentModelAccessResult>;
 
   /**
    * 解析某 session 的 cc-debug raw 文件落盘路径 (host 注入)。host 用 logger 的 logDir 拼
@@ -1116,6 +1129,11 @@ export interface AgentDeps {
      * but typed as unknown here to avoid cross-package dependency.
      */
     onApprovalRequest?: (params: unknown) => Promise<unknown>;
+    /**
+     * 远端 daemon 的 PreToolUse 通过反向 RPC 调回同一个实时模型准入 resolver。
+     * Params/Result 采用 maker-cc-manager 的同名协议形状，但保持 unknown 以免耦包。
+     */
+    onSubagentModelAccessRequest?: (params: unknown) => Promise<unknown>;
     /**
      * 本 session 的 Maker Memory 注入开关 (startSession 时已按 per-session flag
      * + manager 就绪归一)。host 据此决定是否把 cindy_memory 以 http 形态经
