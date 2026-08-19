@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { AgentEvent } from '../../../types/events.js';
+import type { AgentEvent, AgentTaskUpdateEventData } from '../../../types/events.js';
 import { createAsyncQueue } from '../../shared/async-queue.js';
 import { UsageTracker } from '../../shared/usage-tracker.js';
 import {
@@ -8,6 +8,11 @@ import {
   translateSdkMessage,
   type TurnState,
 } from '../translator.js';
+
+type AgentTaskUpdateEvent = AgentEvent & {
+  type: 'agent_task_update';
+  data: AgentTaskUpdateEventData;
+};
 
 function createTurnState(): TurnState {
   return {
@@ -142,6 +147,362 @@ describe('Claude Code assistant text streaming contract', () => {
     ]);
   });
 
+  it('does not emit a leaked Grok stop token as assistant text', async () => {
+    const queue = createAsyncQueue<AgentEvent>();
+    const ctx = createCtx();
+
+    translateSdkMessage(
+      {
+        type: 'assistant',
+        uuid: 'assistant-eos',
+        session_id: 'sdk-session',
+        parent_tool_use_id: null,
+        message: {
+          model: 'grok-4.6',
+          content: [{ type: 'text', text: '<|eos|>' }],
+        },
+      },
+      queue,
+      ctx,
+    );
+
+    const textEvents = (await collect(queue)).filter((event) => event.type === 'text');
+    expect(textEvents).toEqual([]);
+    expect(ctx.turn.hasEmittedText).toBe(false);
+    expect(ctx.turn.uiEmittedText).toBe('');
+    expect(ctx.turn.lastAssistantMsgHadSubstance).toBe(true);
+  });
+
+  it('does not emit a stop token split across streaming deltas', async () => {
+    const queue = createAsyncQueue<AgentEvent>();
+    const ctx = createCtx();
+
+    for (const [uuid, text] of [
+      ['stream-eos-1', '<|eo'],
+      ['stream-eos-2', 's|>'],
+    ] as const) {
+      translateSdkMessage(
+        {
+          type: 'stream_event',
+          uuid,
+          session_id: 'sdk-session',
+          parent_tool_use_id: null,
+          event: { type: 'content_block_delta', delta: { type: 'text_delta', text } },
+        },
+        queue,
+        ctx,
+      );
+    }
+
+    const textEvents = (await collect(queue)).filter((event) => event.type === 'text');
+    expect(textEvents).toEqual([]);
+    expect(ctx.turn.hasEmittedText).toBe(false);
+    expect(ctx.turn.uiEmittedText).toBe('');
+  });
+
+  it('does not emit a stop token split as a single-character prefix', async () => {
+    const queue = createAsyncQueue<AgentEvent>();
+    const ctx = createCtx();
+
+    for (const [uuid, text] of [
+      ['stream-lt-1', '<'],
+      ['stream-lt-2', '|eos|>'],
+    ] as const) {
+      translateSdkMessage(
+        {
+          type: 'stream_event',
+          uuid,
+          session_id: 'sdk-session',
+          parent_tool_use_id: null,
+          event: { type: 'content_block_delta', delta: { type: 'text_delta', text } },
+        },
+        queue,
+        ctx,
+      );
+    }
+
+    const textEvents = (await collect(queue)).filter((event) => event.type === 'text');
+    expect(textEvents).toEqual([]);
+    expect(ctx.turn.hasEmittedText).toBe(false);
+    expect(ctx.turn.uiEmittedText).toBe('');
+  });
+
+  it('does not emit leading whitespace from a split standalone stop token', async () => {
+    const queue = createAsyncQueue<AgentEvent>();
+    const ctx = createCtx();
+
+    for (const [uuid, text] of [
+      ['stream-ws-1', '  <|eo'],
+      ['stream-ws-2', 's|>'],
+    ] as const) {
+      translateSdkMessage(
+        {
+          type: 'stream_event',
+          uuid,
+          session_id: 'sdk-session',
+          parent_tool_use_id: null,
+          event: { type: 'content_block_delta', delta: { type: 'text_delta', text } },
+        },
+        queue,
+        ctx,
+      );
+    }
+
+    const textEvents = (await collect(queue)).filter((event) => event.type === 'text');
+    expect(textEvents).toEqual([]);
+    expect(ctx.turn.hasEmittedText).toBe(false);
+    expect(ctx.turn.uiEmittedText).toBe('');
+  });
+
+  it('keeps an embedded stop token in streamed assistant prose', async () => {
+    const queue = createAsyncQueue<AgentEvent>();
+    const ctx = createCtx();
+
+    for (const [uuid, text] of [
+      ['stream-embed-1', 'The token is '],
+      ['stream-embed-2', '<|eos|>'],
+    ] as const) {
+      translateSdkMessage(
+        {
+          type: 'stream_event',
+          uuid,
+          session_id: 'sdk-session',
+          parent_tool_use_id: null,
+          event: { type: 'content_block_delta', delta: { type: 'text_delta', text } },
+        },
+        queue,
+        ctx,
+      );
+    }
+
+    const textEvents = (await collect(queue)).filter((event) => event.type === 'text');
+    expect(textEvents.map((event) => event.data)).toEqual([
+      { text: 'The token is ', isFinal: false },
+      { text: '<|eos|>', isFinal: false },
+    ]);
+    expect(ctx.turn.uiEmittedText).toBe('The token is <|eos|>');
+  });
+
+  it('keeps later tool-loop prose after a final assistant envelope', async () => {
+    const queue = createAsyncQueue<AgentEvent>();
+    const ctx = createCtx();
+
+    translateSdkMessage(
+      {
+        type: 'assistant',
+        uuid: 'assistant-first',
+        session_id: 'sdk-session',
+        parent_tool_use_id: null,
+        message: {
+          model: 'claude-opus-4-6',
+          content: [{ type: 'text', text: '先看一眼。' }],
+        },
+      },
+      queue,
+      ctx,
+    );
+    translateSdkMessage(
+      {
+        type: 'stream_event',
+        uuid: 'stream-second',
+        session_id: 'sdk-session',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '再改一处。' } },
+      },
+      queue,
+      ctx,
+    );
+
+    const textEvents = (await collect(queue)).filter((event) => event.type === 'text');
+    expect(textEvents.map((event) => event.data)).toEqual([
+      { text: '先看一眼。', isFinal: true },
+      { text: '再改一处。', isFinal: false },
+    ]);
+    expect(ctx.turn.uiEmittedText).toBe('先看一眼。再改一处。');
+  });
+
+  it('does not mix concurrent stream prefixes when sanitizing stop tokens', async () => {
+    const queue = createAsyncQueue<AgentEvent>();
+    const ctx = createCtx();
+
+    translateSdkMessage(
+      {
+        type: 'stream_event',
+        uuid: 'stream-a',
+        session_id: 'sdk-session',
+        parent_tool_use_id: 'toolu-a',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '<|eo' } },
+      },
+      queue,
+      ctx,
+    );
+    translateSdkMessage(
+      {
+        type: 'stream_event',
+        uuid: 'stream-b',
+        session_id: 'sdk-session',
+        parent_tool_use_id: 'toolu-b',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'answer' } },
+      },
+      queue,
+      ctx,
+    );
+
+    const textEvents = (await collect(queue)).filter((event) => event.type === 'text');
+    expect(textEvents).toEqual([
+      expect.objectContaining({
+        data: { text: 'answer', isFinal: false },
+        agentMeta: expect.objectContaining({ parentUuid: 'toolu-b' }),
+      }),
+    ]);
+    expect(ctx.turn.uiEmittedText).toBe('answer');
+    expect(ctx.rt.streamStopTokenByKey.get('toolu-a:0')).toEqual({
+      pending: '<|eo',
+      emitted: false,
+    });
+  });
+
+  it('still drops a split stop token after another stream has emitted prose', async () => {
+    const queue = createAsyncQueue<AgentEvent>();
+    const ctx = createCtx();
+
+    translateSdkMessage(
+      {
+        type: 'stream_event',
+        uuid: 'stream-a-1',
+        session_id: 'sdk-session',
+        parent_tool_use_id: 'toolu-a',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '<|eo' } },
+      },
+      queue,
+      ctx,
+    );
+    translateSdkMessage(
+      {
+        type: 'stream_event',
+        uuid: 'stream-b',
+        session_id: 'sdk-session',
+        parent_tool_use_id: 'toolu-b',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'answer' } },
+      },
+      queue,
+      ctx,
+    );
+    translateSdkMessage(
+      {
+        type: 'stream_event',
+        uuid: 'stream-a-2',
+        session_id: 'sdk-session',
+        parent_tool_use_id: 'toolu-a',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 's|>' } },
+      },
+      queue,
+      ctx,
+    );
+
+    const textEvents = (await collect(queue)).filter((event) => event.type === 'text');
+    expect(textEvents).toEqual([
+      expect.objectContaining({
+        data: { text: 'answer', isFinal: false },
+        agentMeta: expect.objectContaining({ parentUuid: 'toolu-b' }),
+      }),
+    ]);
+    expect(ctx.turn.uiEmittedText).toBe('answer');
+    expect(ctx.rt.streamStopTokenByKey.get('toolu-a:0')).toEqual({
+      pending: '<|eos|>',
+      emitted: false,
+    });
+  });
+
+  it('still drops a later standalone stop token after earlier same-stream prose', async () => {
+    const queue = createAsyncQueue<AgentEvent>();
+    const ctx = createCtx();
+
+    translateSdkMessage(
+      {
+        type: 'assistant',
+        uuid: 'assistant-first',
+        session_id: 'sdk-session',
+        parent_tool_use_id: null,
+        message: {
+          model: 'grok-4.6',
+          content: [{ type: 'text', text: '先看一眼。' }],
+        },
+      },
+      queue,
+      ctx,
+    );
+    translateSdkMessage(
+      {
+        type: 'stream_event',
+        uuid: 'stream-eos',
+        session_id: 'sdk-session',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '<|eos|>' } },
+      },
+      queue,
+      ctx,
+    );
+
+    const textEvents = (await collect(queue)).filter((event) => event.type === 'text');
+    expect(textEvents.map((event) => event.data)).toEqual([
+      { text: '先看一眼。', isFinal: true },
+    ]);
+    expect(ctx.turn.uiEmittedText).toBe('先看一眼。');
+    expect(ctx.rt.streamStopTokenByKey.get('__main__:0')).toEqual({
+      pending: '<|eos|>',
+      emitted: false,
+    });
+  });
+
+  it('drops a later text-block leftover after earlier prose in the same envelope', async () => {
+    const queue = createAsyncQueue<AgentEvent>();
+    const ctx = createCtx();
+
+    translateSdkMessage(
+      {
+        type: 'stream_event',
+        uuid: 'block-0',
+        session_id: 'sdk-session',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '先看一眼。' } },
+      },
+      queue,
+      ctx,
+    );
+    translateSdkMessage(
+      {
+        type: 'stream_event',
+        uuid: 'block-1-start',
+        session_id: 'sdk-session',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_start', index: 1, content_block: { type: 'text' } },
+      },
+      queue,
+      ctx,
+    );
+    translateSdkMessage(
+      {
+        type: 'stream_event',
+        uuid: 'block-1',
+        session_id: 'sdk-session',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: '<|eos|>' } },
+      },
+      queue,
+      ctx,
+    );
+
+    const textEvents = (await collect(queue)).filter((event) => event.type === 'text');
+    expect(textEvents.map((event) => event.data)).toEqual([
+      { text: '先看一眼。', isFinal: false },
+    ]);
+    expect(ctx.rt.streamStopTokenByKey.get('__main__:1')).toEqual({
+      pending: '<|eos|>',
+      emitted: false,
+    });
+  });
+
   it('keeps a result fallback tail unmarked so it cannot replace accumulated streaming text', async () => {
     const queue = createAsyncQueue<AgentEvent>();
     const ctx = createCtx();
@@ -177,7 +538,7 @@ describe('Claude Code assistant text streaming contract', () => {
 });
 
 describe('Claude Code translator subagent model attribution', () => {
-  it('promotes the full child assistant actual model into the parent task update', async () => {
+  it('keeps an early full child model without publishing a temporary task id', async () => {
     const queue = createAsyncQueue<AgentEvent>();
     const ctx = createCtx();
 
@@ -211,24 +572,50 @@ describe('Claude Code translator subagent model attribution', () => {
     );
 
     const events = await collect(queue);
-    expect(events.find((event) => event.type === 'agent_task_update')?.data).toEqual({
-      provider: 'claude-code',
-      taskId: 'toolu_agent_a',
-      parentToolUseId: 'toolu_agent_a',
-      status: 'running',
-      model: 'codex/gpt-5.6-sol',
-      subagentObservation: {
-        kind: 'progress',
-        logicalSubagentId: 'toolu_agent_a',
-        parentToolUseId: 'toolu_agent_a',
-      },
-    });
+    expect(events.find((event) => event.type === 'agent_task_update')).toBeUndefined();
     expect(events.find((event) => event.type === 'text')?.agentMeta).toEqual(
       expect.objectContaining({
         parentUuid: 'toolu_agent_a',
         model: 'codex/gpt-5.6-sol',
       }),
     );
+  });
+
+  it('publishes the saved child model when the stable task id arrives', async () => {
+    const queue = createAsyncQueue<AgentEvent>();
+    const ctx = createCtx();
+
+    translateSdkMessage(
+      {
+        type: 'assistant',
+        parent_tool_use_id: 'toolu_agent_a',
+        message: { model: 'codex/gpt-5.6-sol', content: [] },
+      },
+      queue,
+      ctx,
+    );
+    translateSdkMessage(
+      {
+        type: 'system',
+        subtype: 'task_started',
+        task_id: 'agent-a',
+        tool_use_id: 'toolu_agent_a',
+        task_type: 'local_agent',
+      },
+      queue,
+      ctx,
+    );
+
+    const taskUpdates = (await collect(queue)).filter(
+      (event): event is AgentTaskUpdateEvent => event.type === 'agent_task_update',
+    );
+    expect(taskUpdates).toHaveLength(1);
+    expect(taskUpdates[0]?.data).toMatchObject({
+      taskId: 'agent-a',
+      parentToolUseId: 'toolu_agent_a',
+      status: 'running',
+      model: 'codex/gpt-5.6-sol',
+    });
   });
 
   it('keeps the child actual model on the later terminal task update', async () => {
@@ -258,8 +645,10 @@ describe('Claude Code translator subagent model attribution', () => {
     );
 
     const taskUpdates = (await collect(queue)).filter(
-      (event) => event.type === 'agent_task_update',
+      (event): event is AgentTaskUpdateEvent =>
+        event.type === 'agent_task_update',
     );
+    expect(taskUpdates).toHaveLength(1);
     expect(taskUpdates.at(-1)?.data).toMatchObject({
       taskId: 'agent-a',
       parentToolUseId: 'toolu_agent_a',
@@ -465,6 +854,119 @@ describe('Claude Code translator subagent model attribution', () => {
         logicalSubagentId: 'agent-a',
         parentToolUseId: 'toolu_agent_a',
       },
+    });
+  });
+
+  it('does not downgrade a terminal task when the async launch receipt arrives late', async () => {
+    // 事件乱序（P1-3）：task_notification: completed 先到，async_launched 回执后到。
+    // 修复前事件序列会变成 completed → running，Renderer 永久转圈。
+    const queue = createAsyncQueue<AgentEvent>();
+    const onSubagentTaskLaunched = vi.fn();
+    const ctx = createCtx({ onSubagentTaskLaunched });
+
+    translateSdkMessage(
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        task_id: 'agent-a',
+        tool_use_id: 'toolu_agent_a',
+        status: 'completed',
+      },
+      queue,
+      ctx,
+    );
+    translateSdkMessage(
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'toolu_agent_a',
+              content: [{ type: 'text', text: 'Async agent launched successfully.' }],
+            },
+          ],
+        },
+        tool_use_result: {
+          isAsync: true,
+          status: 'async_launched',
+          agentId: 'agent-a',
+          prompt: 'Survey the codebase',
+          resolvedModel: 'codex/gpt-5.6-sol',
+        },
+      },
+      queue,
+      ctx,
+    );
+
+    const taskUpdates = (await collect(queue)).filter(
+      (event) => event.type === 'agent_task_update',
+    );
+    // 迟到的 launch 回执保留终态、只补模型元数据；也不重放 onSubagentTaskLaunched。
+    expect(taskUpdates.at(-1)?.data).toMatchObject({
+      taskId: 'agent-a',
+      parentToolUseId: 'toolu_agent_a',
+      status: 'completed',
+      model: 'codex/gpt-5.6-sol',
+    });
+    expect(onSubagentTaskLaunched).not.toHaveBeenCalled();
+  });
+
+  it('keeps the internal terminal latch when task_started/task_progress arrive late (projection unchanged)', async () => {
+    // 迟到的 task_started/task_progress 事件仍按 running 投影下发（下游
+    // terminalBackgroundTaskIds 按 taskId 丢弃，两道闸口径一致）；但内部终态登记
+    // 不得被降级——迟到的 child assistant 读 Map 时必须仍看到终态。
+    const queue = createAsyncQueue<AgentEvent>();
+    const ctx = createCtx();
+
+    translateSdkMessage(
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        task_id: 'agent-a',
+        tool_use_id: 'toolu_agent_a',
+        status: 'failed',
+      },
+      queue,
+      ctx,
+    );
+    translateSdkMessage(
+      {
+        type: 'system',
+        subtype: 'task_progress',
+        task_id: 'agent-a',
+        tool_use_id: 'toolu_agent_a',
+      },
+      queue,
+      ctx,
+    );
+    // 迟到的 child assistant：读内部 Map 投影状态。若上面的 task_progress 把 Map
+    // 降级回 running，这里会推 running 帧；终态闩保住时应为 failed。
+    translateSdkMessage(
+      {
+        type: 'assistant',
+        parent_tool_use_id: 'toolu_agent_a',
+        message: { model: 'codex/gpt-5.6-sol', content: [] },
+      },
+      queue,
+      ctx,
+    );
+
+    const taskUpdates = (await collect(queue)).filter(
+      (event): event is AgentTaskUpdateEvent =>
+        event.type === 'agent_task_update',
+    );
+    const progressFrame = taskUpdates.find(
+      (event) => event.data.subagentObservation?.kind === 'progress'
+        && event.data.taskId === 'agent-a',
+    );
+    // 迟到的 task_progress 投影保持 running（交给下游终态闩丢弃，translator 不改写）。
+    expect(progressFrame?.data.status).toBe('running');
+    // 最后一帧（child assistant）读内部闩，终态未被降级。
+    expect(taskUpdates.at(-1)?.data).toMatchObject({
+      status: 'failed',
+      model: 'codex/gpt-5.6-sol',
     });
   });
 

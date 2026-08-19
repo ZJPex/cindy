@@ -218,6 +218,36 @@ function spawnItemHasRunningAgentState(item: unknown): boolean {
   });
 }
 
+/**
+ * 读取 agentsStates 里某个子线程的终态标签（completed-only spawn 的唯一终态证据）。
+ *
+ * app-server 可能省略 item/started，首个可见帧直接是 completed 的 collab 快照——
+ * 那里 agentsStates 已是各子线程的**真实终态**。不同步进 tracker 的话线程恒为
+ * running，drainRunningForShutdown 会把已完成的子代理持久化成 stopped（P1-4）。
+ * 返回 undefined = 无标签或标签不认识（不猜）。
+ */
+function agentStateTerminalStatus(state: unknown): SubagentLiveCardStatus | undefined {
+  let label: unknown = typeof state === 'string' ? state : undefined;
+  if (!label && state && typeof state === 'object') {
+    const stateRecord = state as Record<string, unknown>;
+    for (const key of ['status', 'state', 'phase']) {
+      if (typeof stateRecord[key] === 'string') {
+        label = stateRecord[key];
+        break;
+      }
+    }
+  }
+  if (typeof label !== 'string') return undefined;
+  const trimmed = label.trim().toLowerCase();
+  // `done` 是 Codex agentsStates 的实际产出拼写（见 translator.test.ts 夹具与
+  // formatCodexAgentStateLabel 消费的同一载荷），漏掉它会把已完成的子代理在
+  // shutdown 时持久化成 stopped（review P1）。
+  if (trimmed === 'completed' || trimmed === 'complete' || trimmed === 'succeeded' || trimmed === 'done') return 'completed';
+  if (trimmed === 'failed' || trimmed === 'error') return 'failed';
+  if (trimmed === 'stopped' || trimmed === 'interrupted' || trimmed === 'cancelled') return 'stopped';
+  return undefined;
+}
+
 interface TrackedCard {
   taskId: string;
   agentPath?: string;
@@ -243,12 +273,15 @@ export function createSubagentLiveCardTracker(opts: {
   now?: () => number;
   maxTrackedCards?: number;
   subagentModelFallback?: string;
+  /** The proxy route makes this model the actual outbound model, not a display guess. */
+  lockSubagentModel?: boolean;
 } = {}): SubagentLiveCardTracker {
   const now = opts.now ?? (() => Date.now());
   const maxTrackedCards = opts.maxTrackedCards ?? DEFAULT_MAX_TRACKED_CARDS;
   const subagentModelFallback = typeof opts.subagentModelFallback === 'string' && opts.subagentModelFallback.trim()
     ? opts.subagentModelFallback.trim()
     : undefined;
+  const lockSubagentModel = opts.lockSubagentModel === true && Boolean(subagentModelFallback);
   const cards = new Map<string, TrackedCard>();
   const taskIdByThread = new Map<string, string>();
   const pending = new Map<string, PendingNotification[]>();
@@ -431,6 +464,11 @@ export function createSubagentLiveCardTracker(opts: {
     observation: ThreadModelObservation | undefined,
   ): boolean => {
     if (!observation) return false;
+    if (
+      lockSubagentModel
+      && thread.modelSource === 'configured'
+      && observation.source === 'runtime'
+    ) return false;
     const previousPriority = thread.modelSource === undefined
       ? -1
       : MODEL_SOURCE_PRIORITY[thread.modelSource];
@@ -612,9 +650,19 @@ export function createSubagentLiveCardTracker(opts: {
     if (!card.threads.has(childThreadId)) {
       const observedModel = pendingThreadModels.get(childThreadId);
       pendingThreadModels.delete(childThreadId);
-      const initialModel = observedModel?.model ?? spawnModel ?? inheritedModel;
-      const initialModelSource = observedModel?.source
-        ?? (spawnModel ? spawnModelSource : inheritedModel ? 'inherited' : undefined);
+      const lockedSpawnModel = lockSubagentModel && spawnModelSource === 'configured'
+        ? { model: spawnModel, source: spawnModelSource }
+        : undefined;
+      const initialObservation = lockedSpawnModel?.model
+        ? lockedSpawnModel
+        : observedModel
+          ?? (spawnModel
+            ? { model: spawnModel, source: spawnModelSource }
+            : inheritedModel
+              ? { model: inheritedModel, source: 'inherited' as const }
+              : undefined);
+      const initialModel = initialObservation?.model;
+      const initialModelSource = initialObservation?.source;
       // spawn item 自己携带的显式/默认/继承模型会由 translator 合并进原有启动帧；
       // 只有 spawn 到达前已经观测到的实际模型才需要在登记后额外重放。
       changed = Boolean(observedModel);
@@ -666,16 +714,21 @@ export function createSubagentLiveCardTracker(opts: {
     ): SubagentLiveCardUpdate | null {
       const registration = readCodexSubagentSpawnRegistration(item);
       if (!registration) return null;
-      // 模型优先级在 spawn 当刻冻结：显式参数 > Cindy 个性化默认 > Codex 原生父线程继承。
-      // 后续 thread/started 的实际 model 仍可通过 noteDescendantThread 覆盖。
-      const spawnModel = registration.model ?? subagentModelFallback ?? inheritedModel;
-      const spawnModelSource: ThreadModelSource | undefined = registration.model
-        ? 'explicit'
-        : subagentModelFallback
-          ? 'configured'
-          : inheritedModel
-            ? 'inherited'
-            : undefined;
+      // 锁定路由存在时，配置模型就是 Proxy 最终出站模型。Codex thread 元数据仍只会
+      // 报告创建阶段继承的父模型，不能把它当作运行时事实覆盖配置。未锁定时保持原生
+      // 优先级：显式参数 > 配置兜底 > 父线程继承，后续真实观测仍可覆盖。
+      const spawnModel = lockSubagentModel
+        ? subagentModelFallback
+        : registration.model ?? subagentModelFallback ?? inheritedModel;
+      const spawnModelSource: ThreadModelSource | undefined = lockSubagentModel
+        ? 'configured'
+        : registration.model
+          ? 'explicit'
+          : subagentModelFallback
+            ? 'configured'
+            : inheritedModel
+              ? 'inherited'
+              : undefined;
 
       const existing = cards.get(registration.taskId);
       const card: TrackedCard = existing ?? {
@@ -719,6 +772,26 @@ export function createSubagentLiveCardTracker(opts: {
         if (attachThread(card, childThreadId, visited, spawnModel, spawnModelSource)) replayed = true;
       }
 
+      // completed 的 agentsStates 是子线程状态证据，无论本卡是刚补建还是 started 阶段
+      // 已经存在都必须同步。只在 fresh completed-only 路径处理会漏掉常见的
+      // started → completed(done)，shutdown 仍会把它错误持久化成 stopped。
+      let terminalObserved = false;
+      if (phase === 'completed') {
+        const states = (item as { agentsStates?: unknown }).agentsStates;
+        const stateByThread = states && typeof states === 'object' && !Array.isArray(states)
+          ? states as Record<string, unknown>
+          : undefined;
+        for (const childThreadId of registration.childThreadIds) {
+          const thread = card.threads.get(childThreadId);
+          if (!thread || thread.spawnFailed) continue;
+          const terminal = stateByThread ? agentStateTerminalStatus(stateByThread[childThreadId]) : undefined;
+          if (terminal && terminal !== 'running') {
+            thread.status = terminal;
+            terminalObserved = true;
+          }
+        }
+      }
+
       // 已登记过的 spawn(同一 collabAgentToolCall 的 started/completed 两个 phase 都会到
       // 这里)**必须无条件回传快照**:translator 在 completed phase 会无条件推一帧
       // status=completed —— 那是 spawn 工具调用自己收口,不代表子代理跑完。调用方在
@@ -729,7 +802,10 @@ export function createSubagentLiveCardTracker(opts: {
       // app-server 可能省略 started/updated，首个可见帧直接是 completed。此时
       // collabAgentToolCall 的完成只代表 spawn 工具已返回；agentsStates 仍明确 running
       // 时必须让 tracker 发出 running 快照，覆盖 translator 合成的 completed。
-      if (phase === 'completed' && spawnItemHasRunningAgentState(item)) return snapshot(card);
+      if (phase === 'completed') {
+        if (spawnItemHasRunningAgentState(item)) return snapshot(card);
+        if (terminalObserved) return snapshot(card);
+      }
       return replayed ? snapshot(card) : null;
     },
 
@@ -747,15 +823,18 @@ export function createSubagentLiveCardTracker(opts: {
         : cards.get(parentTaskId)?.threads.get(parentThreadId)?.model;
       // 嵌套 spawn 没有显式 model 时遵循同一优先级：个性化默认优先，否则继承直接父线程。
       // 普通 thread/started 观测不走此兜底，避免把“没上报”误当成一次覆盖。
-      const effectiveModel = model
-        ?? (inheritParentModel ? subagentModelFallback ?? parentModel : undefined);
-      const effectiveModelSource: ThreadModelSource | undefined = model
-        ? inheritParentModel ? 'explicit' : 'runtime'
-        : inheritParentModel && subagentModelFallback
-          ? 'configured'
-          : inheritParentModel && parentModel
-            ? 'inherited'
-            : undefined;
+      const effectiveModel = lockSubagentModel
+        ? subagentModelFallback
+        : model ?? (inheritParentModel ? subagentModelFallback ?? parentModel : undefined);
+      const effectiveModelSource: ThreadModelSource | undefined = lockSubagentModel
+        ? 'configured'
+        : model
+          ? inheritParentModel ? 'explicit' : 'runtime'
+          : inheritParentModel && subagentModelFallback
+            ? 'configured'
+            : inheritParentModel && parentModel
+              ? 'inherited'
+              : undefined;
       const directTaskId = taskIdByThread.get(childThreadId);
       if (directTaskId !== undefined) {
         pendingThreadModels.delete(childThreadId);

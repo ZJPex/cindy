@@ -7,7 +7,8 @@ import {
 } from '../../../shared/subagentModelSettings';
 import {
   buildCodexSubagentSpawnArgs,
-  codexSubagentRuntimeModelId,
+  codexSubagentRouteResolutionFailed,
+  resolveCodexSubagentHostCredentialPlan,
   resolveCodexSubagentModelFallback,
   resolveCodexSubagentRouteSnapshot,
 } from '../codex-subagent-config';
@@ -41,16 +42,14 @@ function providerView(
   } as unknown as ProviderView;
 }
 
-// 默认设置注入的两个 features 段键(Cindy 策略 + spawn 模型覆盖)。
-const DELEGATION_ARGS_PREFIXES = [
-  'features.multi_agent_v2.multi_agent_mode_hint_text="',
-  'features.multi_agent_v2.expose_spawn_agent_model_overrides=true',
-] as const;
+const DELEGATION_HINT_PREFIX = 'features.multi_agent_v2.multi_agent_mode_hint_text="';
+const MODEL_OVERRIDE_PREFIX = 'features.multi_agent_v2.expose_spawn_agent_model_overrides=';
 
-function expectDelegationArgs(args: string[]): void {
-  for (const prefix of DELEGATION_ARGS_PREFIXES) {
-    expect(args.some((arg) => arg.startsWith(prefix))).toBe(true);
-  }
+function expectDelegationArgs(args: string[], modelOverridesExposed = true): void {
+  expect(args.some((arg) => arg.startsWith(DELEGATION_HINT_PREFIX))).toBe(true);
+  expect(args).toContain(
+    `${MODEL_OVERRIDE_PREFIX}${modelOverridesExposed ? 'true' : 'false'}`,
+  );
 }
 
 /** 去掉默认 feature 键值对(连同配对的 '-c'),只留设置驱动的 agents.* 部分。 */
@@ -58,7 +57,7 @@ function withoutDelegationArgs(args: string[]): string[] {
   const out: string[] = [];
   for (let i = 0; i < args.length; i += 2) {
     const kv = args[i + 1] ?? '';
-    if (DELEGATION_ARGS_PREFIXES.some((prefix) => kv.startsWith(prefix))) continue;
+    if (kv.startsWith(DELEGATION_HINT_PREFIX) || kv.startsWith(MODEL_OVERRIDE_PREFIX)) continue;
     out.push(args[i]!, kv);
   }
   return out;
@@ -76,6 +75,11 @@ describe('buildCodexSubagentSpawnArgs', () => {
   });
 
   it('uses Codex native scheduling when the Cindy policy is off', () => {
+    const route = {
+      providerId: 'openai',
+      catalogModel: 'gpt-5.6-terra',
+      reasoningEffort: 'high' as const,
+    };
     const args = buildCodexSubagentSpawnArgs(
       settings({
         codexUseCindySubagentPolicy: false,
@@ -84,18 +88,15 @@ describe('buildCodexSubagentSpawnArgs', () => {
         codexMaxConcurrentSubagents: 4,
         codexAllowNestedSubagents: true,
       }),
+      route,
     );
     expect(
       args.some((arg) =>
         arg.startsWith('features.multi_agent_v2.multi_agent_mode_hint_text='),
       ),
     ).toBe(false);
-    expect(args).toContain('features.multi_agent_v2.expose_spawn_agent_model_overrides=true');
+    expect(args).toContain('features.multi_agent_v2.expose_spawn_agent_model_overrides=false');
     expect(withoutDelegationArgs(args)).toEqual([
-      '-c',
-      'agents.default_subagent_model="gpt-5.6-terra"',
-      '-c',
-      'agents.default_subagent_reasoning_effort="high"',
       '-c',
       'agents.max_concurrent_threads_per_session=4',
       '-c',
@@ -128,26 +129,25 @@ describe('buildCodexSubagentSpawnArgs', () => {
     ).toEqual(['-c', 'agents.enabled=false']);
   });
 
-  it('quotes string values and keeps numbers bare (TOML forms)', () => {
+  it('keeps a locked model and effort out of Codex spawn args', () => {
+    const configured = settings({
+      codex: 'gpt-5.6-terra',
+      codexProviderId: 'openai',
+      codexEffort: 'medium',
+      codexMaxConcurrentSubagents: 3,
+    });
     const args = buildCodexSubagentSpawnArgs(
-      settings({
-        codex: 'gpt-5.6-terra',
-        codexEffort: 'medium',
-        codexMaxConcurrentSubagents: 3,
-      }),
+      configured,
+      resolveCodexSubagentRouteSnapshot(configured),
     );
-    expectDelegationArgs(args);
+    expectDelegationArgs(args, false);
     expect(withoutDelegationArgs(args)).toEqual([
-      '-c',
-      'agents.default_subagent_model="gpt-5.6-terra"',
-      '-c',
-      'agents.default_subagent_reasoning_effort="medium"',
       '-c',
       'agents.max_concurrent_threads_per_session=3',
     ]);
   });
 
-  it('uses the selected Provider rewrite for the runtime slug accepted by spawn_agent', () => {
+  it('never serializes a Provider-prefixed locked model into spawn_agent config', () => {
     setCustomProviders([{
       id: 'spawn-rewrite-provider',
       name: 'Spawn Rewrite Provider',
@@ -165,12 +165,16 @@ describe('buildCodexSubagentSpawnArgs', () => {
       models: { codex: [{ id: 'vendor-a/model-a', name: 'Model A' }] },
     } as never]);
     try {
+      const configured = settings({
+        codex: 'vendor-a/model-a',
+        codexProviderId: 'spawn-rewrite-provider',
+      });
       expect(
-        withoutDelegationArgs(buildCodexSubagentSpawnArgs(settings({
-          codex: 'vendor-a/model-a',
-          codexProviderId: 'spawn-rewrite-provider',
-        }))),
-      ).toEqual(['-c', 'agents.default_subagent_model="model-a"']);
+        withoutDelegationArgs(buildCodexSubagentSpawnArgs(
+          configured,
+          resolveCodexSubagentRouteSnapshot(configured),
+        )),
+      ).toEqual([]);
     } finally {
       setCustomProviders([]);
     }
@@ -212,7 +216,9 @@ describe('buildCodexSubagentSpawnArgs', () => {
     );
     for (const arg of exhaustive) {
       if (!arg.startsWith('features.multi_agent_v2')) continue;
-      expect(DELEGATION_ARGS_PREFIXES.some((prefix) => arg.startsWith(prefix))).toBe(true);
+      expect(
+        arg.startsWith(DELEGATION_HINT_PREFIX) || arg.startsWith(MODEL_OVERRIDE_PREFIX),
+      ).toBe(true);
     }
     expect(
       exhaustive.some((arg) => arg.includes('features.multi_agent_v2.max_concurrent')),
@@ -227,12 +233,12 @@ describe('buildCodexSubagentSpawnArgs', () => {
     }
   });
 
-  it('escapes TOML-breaking characters defensively', () => {
+  it('fails closed when a configured model has no enforceable route', () => {
     expect(
       withoutDelegationArgs(
         buildCodexSubagentSpawnArgs(settings({ codex: 'weird"model\\id' })),
       ),
-    ).toEqual(['-c', 'agents.default_subagent_model="weird\\"model\\\\id"']);
+    ).toEqual(['-c', 'agents.enabled=false']);
   });
 });
 
@@ -261,10 +267,15 @@ describe('resolveCodexSubagentModelFallback', () => {
   });
 });
 
-describe('codexSubagentRuntimeModelId', () => {
+describe('resolveCodexSubagentRouteSnapshot', () => {
   it('resolves a provider-less native Codex model with the selector default source', () => {
+    const configured = settings({
+      codex: 'gpt-5.6-terra',
+      codexProviderId: null,
+      codexEffort: 'high',
+    });
     const route = resolveCodexSubagentRouteSnapshot(
-      settings({ codex: 'gpt-5.6-terra', codexProviderId: null }),
+      configured,
       undefined,
       [
         providerView('xd', 'gpt-5.6-terra'),
@@ -275,15 +286,14 @@ describe('codexSubagentRuntimeModelId', () => {
     expect(route).toEqual({
       providerId: 'openai',
       catalogModel: 'gpt-5.6-terra',
-      runtimeModel: 'gpt-5.6-terra',
+      reasoningEffort: 'high',
     });
-    expect(withoutDelegationArgs(buildCodexSubagentSpawnArgs(
-      settings({ codex: 'gpt-5.6-terra', codexProviderId: null }),
-      route,
-    ))).toEqual(['-c', 'agents.default_subagent_model="gpt-5.6-terra"']);
+    const args = buildCodexSubagentSpawnArgs(configured, route);
+    expectDelegationArgs(args, false);
+    expect(withoutDelegationArgs(args)).toEqual([]);
   });
 
-  it('uses the connected implicit Provider rewrite for provider-less stored settings', () => {
+  it('freezes the connected implicit Provider without rewriting the catalog model', () => {
     setCustomProviders([{
       id: 'implicit-rewrite-provider',
       name: 'Implicit Rewrite Provider',
@@ -311,12 +321,10 @@ describe('codexSubagentRuntimeModelId', () => {
       expect(route).toEqual({
         providerId: 'implicit-rewrite-provider',
         catalogModel: 'route/model-a',
-        runtimeModel: 'model-a',
+        reasoningEffort: null,
       });
-      expect(withoutDelegationArgs(buildCodexSubagentSpawnArgs(configured, route))).toEqual([
-        '-c',
-        'agents.default_subagent_model="model-a"',
-      ]);
+      expectDelegationArgs(buildCodexSubagentSpawnArgs(configured, route), false);
+      expect(withoutDelegationArgs(buildCodexSubagentSpawnArgs(configured, route))).toEqual([]);
     } finally {
       setCustomProviders([]);
     }
@@ -330,7 +338,42 @@ describe('codexSubagentRuntimeModelId', () => {
     )).toBeUndefined();
   });
 
-  it('applies an arbitrary Provider-declared model rewrite without prefix hardcoding', () => {
+  it('strictly validates an explicitly saved Provider against the current catalog', () => {
+    const configured = settings({
+      codex: 'route/model-a',
+      codexProviderId: 'explicit-provider',
+      codexEffort: 'high',
+    });
+    expect(resolveCodexSubagentRouteSnapshot(
+      configured,
+      undefined,
+      [providerView('explicit-provider', 'route/model-a', { source: 'user' })],
+    )).toEqual({
+      providerId: 'explicit-provider',
+      catalogModel: 'route/model-a',
+      reasoningEffort: 'high',
+    });
+    expect(resolveCodexSubagentRouteSnapshot(
+      configured,
+      undefined,
+      [providerView('explicit-provider', 'other-model', { source: 'user' })],
+    )).toBeUndefined();
+    expect(resolveCodexSubagentRouteSnapshot(
+      configured,
+      undefined,
+      [providerView('explicit-provider', 'route/model-a', {
+        connected: false,
+        source: 'user',
+      })],
+    )).toBeUndefined();
+    expect(resolveCodexSubagentRouteSnapshot(
+      configured,
+      undefined,
+      [providerView('fallback-provider', 'route/model-a', { source: 'user' })],
+    )).toBeUndefined();
+  });
+
+  it('keeps Provider wire rewrites out of the frozen catalog identity', () => {
     setCustomProviders([{
       id: 'runtime-rewrite-provider',
       name: 'Runtime Rewrite Provider',
@@ -348,20 +391,108 @@ describe('codexSubagentRuntimeModelId', () => {
       models: { codex: [{ id: 'route/model-a', name: 'Model A' }] },
     } as never]);
     try {
-      expect(codexSubagentRuntimeModelId(' route/model-a ', 'runtime-rewrite-provider'))
-        .toBe('model-a');
-      expect(codexSubagentRuntimeModelId('model-a', 'runtime-rewrite-provider'))
-        .toBe('model-a');
       expect(resolveCodexSubagentRouteSnapshot(settings({
         codex: 'route/model-a',
         codexProviderId: 'runtime-rewrite-provider',
+        codexEffort: 'max',
       }))).toEqual({
         providerId: 'runtime-rewrite-provider',
         catalogModel: 'route/model-a',
-        runtimeModel: 'model-a',
+        reasoningEffort: 'max',
       });
     } finally {
       setCustomProviders([]);
     }
+  });
+
+  it('preserves the Gateway budget model id verbatim for Proxy routing', () => {
+    expect(resolveCodexSubagentRouteSnapshot(settings({
+      codex: 'codex/gpt-5.6-sol',
+      codexProviderId: 'xd',
+      codexEffort: 'ultra',
+    }))).toEqual({
+      providerId: 'xd',
+      catalogModel: 'codex/gpt-5.6-sol',
+      reasoningEffort: 'ultra',
+    });
+  });
+
+  it('fails closed when a configured local model has no resolved Provider route', () => {
+    const configured = settings({ codex: 'gpt-5.6-terra' });
+    const route = {
+      providerId: 'openai',
+      catalogModel: 'gpt-5.6-terra',
+      reasoningEffort: null,
+    };
+
+    expect(codexSubagentRouteResolutionFailed(configured, undefined)).toBe(true);
+    expect(codexSubagentRouteResolutionFailed(configured, route)).toBe(false);
+    expect(codexSubagentRouteResolutionFailed(configured, undefined, {
+      remoteHostId: 'remote-a',
+    })).toBe(false);
+    expect(codexSubagentRouteResolutionFailed(configured, undefined, {
+      isReview: true,
+    })).toBe(false);
+    expect(codexSubagentRouteResolutionFailed(settings({ codex: null }), undefined)).toBe(false);
+    expect(codexSubagentRouteResolutionFailed(settings({
+      codex: 'gpt-5.6-terra',
+      codexSubagentsEnabled: false,
+    }), undefined)).toBe(false);
+  });
+
+  it('disables subagents when the frozen Provider route cannot be enforced', () => {
+    const configured = settings({
+      codex: 'codex/gpt-5.6-sol',
+      codexProviderId: 'xd',
+    });
+    expect(
+      withoutDelegationArgs(buildCodexSubagentSpawnArgs(configured, undefined, {
+        forceDisableSubagents: true,
+      })),
+    ).toEqual(['-c', 'agents.enabled=false']);
+    expect(
+      withoutDelegationArgs(buildCodexSubagentSpawnArgs(configured, undefined)),
+    ).toEqual(['-c', 'agents.enabled=false']);
+    const route = resolveCodexSubagentRouteSnapshot(configured);
+    const lockedArgs = buildCodexSubagentSpawnArgs(configured, route);
+    expectDelegationArgs(lockedArgs, false);
+    expect(withoutDelegationArgs(lockedArgs)).toEqual([]);
+    expect(
+      withoutDelegationArgs(buildCodexSubagentSpawnArgs(
+        settings({ codex: 'gpt-5.6-terra', codexProviderId: 'openai' }),
+        undefined,
+        { forceDisableSubagents: true },
+      )),
+    ).toEqual(['-c', 'agents.enabled=false']);
+  });
+});
+
+describe('resolveCodexSubagentHostCredentialPlan', () => {
+  const openAiRoute = {
+    providerId: 'openai',
+    catalogModel: 'gpt-5.6-terra',
+    reasoningEffort: null,
+  };
+  const openAiViews = [providerView('openai', 'gpt-5.6-terra')];
+
+  it('upgrades a provider OAuth parent host for a connected ChatGPT locked route', () => {
+    expect(resolveCodexSubagentHostCredentialPlan(
+      openAiRoute,
+      openAiViews,
+      'provider-oauth',
+      true,
+    )).toEqual({
+      forceDisableSubagents: false,
+      requiredSpawnCredentialMode: 'oauth-bearer',
+    });
+  });
+
+  it('fails closed when the ChatGPT locked route has no OAuth credential', () => {
+    expect(resolveCodexSubagentHostCredentialPlan(
+      openAiRoute,
+      openAiViews,
+      'provider-oauth',
+      false,
+    )).toEqual({ forceDisableSubagents: true });
   });
 });

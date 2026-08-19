@@ -28,6 +28,7 @@ import {
 } from '@cindy/maker-shared/error-redaction';
 import {
   stableInternalWebCitationBoundary,
+  stableStandaloneModelStopTokenBoundary,
   stripInternalWebCitations,
 } from '@cindy/maker-shared/internal-citation';
 
@@ -642,6 +643,7 @@ export function translatePlanUpdatedNotification(
     data: {
       toolUseId: `plan:${params.turnId}`,
       toolName: 'update_plan',
+      runtimeActivity: 'snapshot',
       input: {
         ...(params.explanation ? { explanation: params.explanation } : {}),
         plan: params.plan,
@@ -715,6 +717,7 @@ export function extractRolloutUpdatePlanFunctionCallEvent(
       data: {
         toolUseId: turnId ? `plan:${turnId}` : `plan-call:${item.call_id ?? 'unknown'}`,
         toolName: 'update_plan',
+        runtimeActivity: 'snapshot',
         input,
       },
       source: 'codex',
@@ -1017,17 +1020,18 @@ export function finalizeCodexCitationText(text: string): string {
 }
 
 export function stableCitationBoundary(text: string): number {
+  const stopTokenEnd = stableStandaloneModelStopTokenBoundary(text);
   const open = findUnfinishedCitationOpen(text);
   if (open !== -1) {
-    return Math.min(open, stableInternalWebCitationBoundary(text));
+    return Math.min(open, stableInternalWebCitationBoundary(text), stopTokenEnd);
   }
   const maxProbe = Math.min(text.length, CODEX_FILE_CITATION_OPEN.length - 1);
   for (let k = maxProbe; k > 0; k -= 1) {
     if (text.endsWith(CODEX_FILE_CITATION_OPEN.slice(0, k))) {
-      return Math.min(text.length - k, stableInternalWebCitationBoundary(text));
+      return Math.min(text.length - k, stableInternalWebCitationBoundary(text), stopTokenEnd);
     }
   }
-  return stableInternalWebCitationBoundary(text);
+  return Math.min(stableInternalWebCitationBoundary(text), stopTokenEnd);
 }
 
 function emitAgentMessageProgress(
@@ -1907,6 +1911,7 @@ interface SubAgentActivityItem {
   agentPath?: string;
   /** Newer Codex builds may include the selected child model on the activity. */
   model?: string;
+  reasoningEffort?: string | null;
 }
 
 /**
@@ -1982,10 +1987,14 @@ function handleSubAgentActivity(
   if (phase === 'started') ctx.rt.emittedToolUse.add(item.id);
   const agentPath = typeof item.agentPath === 'string' ? item.agentPath : undefined;
   const model = typeof item.model === 'string' && item.model ? item.model : undefined;
+  const reasoningEffort = typeof item.reasoningEffort === 'string' && item.reasoningEffort
+    ? item.reasoningEffort
+    : undefined;
   const input: Record<string, unknown> = {};
   if (agentPath) input.name = agentPath;
   if (item.agentThreadId) input.agentThreadId = item.agentThreadId;
   if (model) input.model = model;
+  if (reasoningEffort) input.reasoningEffort = reasoningEffort;
   queue.push({
     type: 'tool_use',
     data: { toolUseId: item.id, toolName: 'collab:spawn', input },
@@ -2022,6 +2031,7 @@ function handleSubAgentActivity(
       ...(item.agentThreadId ? { receiverThreadIds: [item.agentThreadId] } : {}),
       ...(agentPath ? { title: agentPath } : {}),
       ...(model ? { model } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
     },
     source: 'codex',
   });

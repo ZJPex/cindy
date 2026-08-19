@@ -21,6 +21,7 @@ import {
 import type { ProviderView } from '@cindy/model-providers';
 import {
   getActiveCatalog,
+  getLocalCatalogOverridesSnapshot,
   setActiveCatalogChangedListener,
   setDiscoveredCodexModels,
 } from './active-catalog.js';
@@ -143,7 +144,7 @@ import {
   AUTO_REVIEW_ROUTER_GUARD_TIMEOUT_MS,
   createAutoReviewModelRouter,
 } from './auto-review-model-router.js';
-import { accountProviderReadinessBarrier } from './account-provider-readiness-barrier.js';
+import { ensureCurrentAccountProviderReadiness } from './account-provider-readiness-ensure.js';
 import { hasClaudeAiOAuth } from './claude-credentials-store.js';
 import {
   armCodexHttpRecovery,
@@ -226,7 +227,9 @@ import {
 } from './codex-gateway-config.js';
 import {
   buildCodexSubagentSpawnArgs,
+  codexSubagentRouteResolutionFailed,
   resolveCodexSubagentModelFallback,
+  resolveCodexSubagentHostCredentialPlan,
   resolveCodexSubagentRouteSnapshot,
 } from './codex-subagent-config.js';
 import { readSubagentModelSettings } from './subagent-model-settings-store.js';
@@ -1460,17 +1463,19 @@ export function getMaker(): Maker {
           ? getCodexControlPlaneProxyEndpoint(authInjection)
           : getCodexProxyEndpoint();
         const subagentModelSettings = readSubagentModelSettings();
-        const subagentModelFallback = resolveCodexSubagentModelFallback(
-          subagentModelSettings,
-          ctx.remoteHostId,
-        );
+        const subagentModelFallback = !isReview
+          ? resolveCodexSubagentModelFallback(subagentModelSettings, ctx.remoteHostId)
+          : undefined;
         let subagentProviderViews: ProviderView[] | undefined;
         if (
-          !ctx.remoteHostId
+          !isReview
+          && !ctx.remoteHostId
           && subagentModelSettings.codexSubagentsEnabled
           && subagentModelSettings.codex?.trim()
-          && !subagentModelSettings.codexProviderId?.trim()
         ) {
+          // 显式来源同样必须按当前目录严格校验；读取失败时保留空数组，令下面的路由
+          // 解析 fail-closed，而不是信任可能已经断连或删除模型的旧设置。
+          subagentProviderViews = [];
           try {
             subagentProviderViews = await getDesktopProviderService().listProviders({
               allowSideEffects: false,
@@ -1481,27 +1486,84 @@ export function getMaker(): Maker {
             });
           }
         }
-        const subagentRoute = resolveCodexSubagentRouteSnapshot(
-          subagentModelSettings,
-          ctx.remoteHostId,
-          subagentProviderViews,
-        );
+        let subagentRoute = !isReview
+          ? resolveCodexSubagentRouteSnapshot(
+              subagentModelSettings,
+              ctx.remoteHostId,
+              subagentProviderViews,
+            )
+          : undefined;
+        let forceDisableSubagents = false;
+        if (codexSubagentRouteResolutionFailed(subagentModelSettings, subagentRoute, {
+          remoteHostId: ctx.remoteHostId,
+          isReview,
+        })) {
+          // 未显式保存 Provider 时依赖目录做隐式解析。解析失败不能继承父任务来源继续
+          // 运行，否则默认子代理模型会静默跑到错误上游。
+          desktopMakerLogger.warn(
+            'Codex subagents disabled: configured model Provider route could not be resolved',
+            { catalogModel: subagentModelSettings.codex?.trim() },
+          );
+          forceDisableSubagents = true;
+        } else if (subagentRoute && !ready) {
+          // proxy 未就绪时 fallback 会直连真实 Gateway，无法兑现冻结的 Provider、
+          // upstream、鉴权与模型恢复。fail-closed：本 app-server 关闭子代理，父任务
+          // 仍可沿既有 Gateway fallback 工作；路由快照也不注册。
+          desktopMakerLogger.warn(
+            'Codex subagents disabled: configured Provider route requires unavailable proxy',
+            { providerId: subagentRoute.providerId, catalogModel: subagentRoute.catalogModel },
+          );
+          forceDisableSubagents = true;
+          subagentRoute = undefined;
+        } else if (subagentRoute) {
+          const selectedRouting = subagentProviderViews
+            ?.find((provider) => provider.id === subagentRoute?.providerId)
+            ?.routing.codex;
+          const hasRequiredOAuth = selectedRouting?.authStrategy === 'oauth-passthrough'
+            ? await desktopCodexAuthAdapter.hasCodexOAuthLogin().catch(() => false)
+            : false;
+          const credentialPlan = resolveCodexSubagentHostCredentialPlan(
+            subagentRoute,
+            subagentProviderViews,
+            credentialMode,
+            hasRequiredOAuth,
+          );
+          if (credentialPlan.forceDisableSubagents) {
+            desktopMakerLogger.warn(
+              'Codex subagents disabled: configured Provider route requires unavailable ChatGPT OAuth',
+              { providerId: subagentRoute.providerId, catalogModel: subagentRoute.catalogModel },
+            );
+            forceDisableSubagents = true;
+            subagentRoute = undefined;
+          } else if (credentialPlan.requiredSpawnCredentialMode) {
+            return {
+              extraArgs: [],
+              extraEnv: {},
+              requiredSpawnCredentialMode: credentialPlan.requiredSpawnCredentialMode,
+              codexProxyActive: ready,
+            };
+          }
+        }
+        const openAiWebSocketsEnabled = !subagentRoute;
         return {
           // 子代理护栏/默认模型每次 createHost 现读 store:DeferredCodexRestart 兑现
           // (dispose host)后的新 spawn 自动带新值。agents.* 对 control-plane 的
           // model/list 无影响,不加 hostPurpose 分支。
           extraArgs: [
             ...mcpExtraArgs,
-            ...(!isReview
-              ? buildCodexSubagentSpawnArgs(subagentModelSettings, subagentRoute)
+            ...(!isReview && !ctx.remoteHostId
+              ? buildCodexSubagentSpawnArgs(subagentModelSettings, subagentRoute, {
+                  forceDisableSubagents,
+                })
               : []),
-            ...buildCodexProxySpawnArgs(endpoint, authInjection),
+            ...buildCodexProxySpawnArgs(endpoint, authInjection, { openAiWebSocketsEnabled }),
           ],
           extraEnv: mcpExtraEnv,
           ...(subagentModelFallback ? { subagentModelFallback } : {}),
           ...(subagentRoute ? { subagentRoute } : {}),
           ...(buildSessionMcpConfig ? { buildSessionMcpConfig } : {}),
           codexProxyActive: ready,
+          codexOpenAiWebSocketsEnabled: useOAuthBearer && ready && openAiWebSocketsEnabled,
           codexBrowserUseAvailable: browserCompanionSpawnConfig.codexBrowserUseAvailable,
           ...(browserCompanion?.status === 'ready'
             ? {
@@ -1785,7 +1847,9 @@ export function getMaker(): Maker {
         availableModels: deriveAvailableModels(getDesktopSelectableCatalog(), 'pi'),
       },
       resolvePiRuntimeModelDescriptor: (providerId, modelId) =>
-        resolvePiRuntimeModelDescriptor(getDesktopSelectableCatalog(), providerId, modelId),
+        resolvePiRuntimeModelDescriptor(getDesktopSelectableCatalog(), providerId, modelId, {
+          localOverrides: getLocalCatalogOverridesSnapshot(),
+        }),
       resolvePiGatewayModelDescriptor: (providerId, modelId) => {
         // `cindy` / null 是 Pi 的默认 gateway 路由；其 wire 由 v3 XD runtime plan
         // 决定，因此描述符也必须锁定 XD，不能让复合 `cindy` 按目录顺序命中同 id 订阅模型。
@@ -1793,6 +1857,7 @@ export function getMaker(): Maker {
           getDesktopSelectableCatalog(),
           resolvePiGatewayDescriptorProviderId(providerId),
           modelId,
+          { localOverrides: getLocalCatalogOverridesSnapshot() },
         );
       },
       mcpProviders: piMcpProviders,
@@ -2018,14 +2083,8 @@ export function getMaker(): Maker {
       // 启动前的 Skill 共享与关闭后的清理都由 desktop host 注入。
       lifecycleHooks: {
         prepareStartOptions: async (sessionId, opts) => {
-          const providerScopeKey = activeOwnerScopeKey();
-          const providerReady =
-            await accountProviderReadinessBarrier.waitForScope(providerScopeKey);
-          if (
-            !providerReady ||
-            activeOwnerScopeKey() !== providerScopeKey ||
-            isAppSessionBoundaryPending()
-          ) {
+          const providerReady = await ensureCurrentAccountProviderReadiness();
+          if (!providerReady) {
             throw new Error('Account provider models are not ready for this app session; retry.');
           }
           await preparePersistedOrcaSessionStart(sessionId, opts as MakerSessionCreateOpts);
