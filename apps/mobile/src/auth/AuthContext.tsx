@@ -1,4 +1,5 @@
 import * as WebBrowser from 'expo-web-browser';
+import { requireNativeModule } from 'expo-modules-core';
 import {
   createContext,
   useCallback,
@@ -9,7 +10,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { AppState, Linking } from 'react-native';
+import { AppState, Linking, Platform } from 'react-native';
 import {
   AuthApiError,
   CindyAuthClient,
@@ -18,6 +19,8 @@ import {
   parseAuthSessionRecord,
   reduceAuthFlow,
   serializeAccountDeletionReceiptRecord,
+  soleAutoStartSsoMethod,
+  soleLoginMethod,
   ssoOrgDiscoveryToMethods,
   serializeAuthSessionRecord,
   type AuthFlowState,
@@ -56,8 +59,9 @@ import {
   resetMobileSessionRealm,
 } from '@/config/env';
 import { syncCanaryChannelAfterAuth } from '@/auth/canaryChannelSync';
-import { ensureDeviceId } from '@/auth/deviceId';
-import { isAccessTokenExpiring } from '@/auth/jwt';
+import { ensureDeviceId, hasStoredDeviceId } from '@/auth/deviceId';
+import { decodeJwtOrgSlug, isAccessTokenExpiring } from '@/auth/jwt';
+import { maybeEnableXdOrgBetaDefault } from '@/auth/xdOrgBetaDefault';
 import { getAuthLocale } from '@/auth/loginMessages';
 import { acquireNativeSocialCredential } from '@/auth/nativeSocial';
 import {
@@ -97,6 +101,12 @@ import {
   clearCanaryChannel,
   syncCanaryChannel,
 } from '@/update/canaryChannelStore';
+import {
+  prepareBetaChannelForDevice,
+  enableUncustomizedBetaChannel,
+  readBetaChannelState,
+} from '@/update/betaChannelStore';
+import { probeBetaChannel } from '@/update/fetchLatestRelease';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -294,6 +304,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const accountDeletionReceiptMutationRef = useRef<Promise<void>>(
     Promise.resolve(),
   );
+  // OAuth deep link、常规登录和冷启动恢复可并发到达。第一次调用必须在创建
+  // device ID 前记录新旧设备状态；后续调用复用同一次 beta 偏好迁移。
+  const betaChannelPreparationRef = useRef<Promise<string> | null>(null);
 
   const suspendSessionRecoveryForLogin = useCallback(() => {
     if (sessionRecoverySuspendedRef.current) return;
@@ -324,6 +337,67 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       ).catch(() => undefined);
     },
     [],
+  );
+
+  const prepareBetaChannelForCurrentDevice = useCallback((): Promise<string> => {
+    const existing = betaChannelPreparationRef.current;
+    if (existing) return existing;
+    const run = (async () => {
+      const hadExistingDeviceId = await hasStoredDeviceId();
+      const did = await ensureDeviceId();
+      // beta 偏好存储异常不能拖垮认证启动；失败时 store 保持 migration hold，
+      // 只会保守地不自动开 beta。
+      await prepareBetaChannelForDevice({ hadExistingDeviceId }).catch(
+        () => undefined,
+      );
+      return did;
+    })();
+    betaChannelPreparationRef.current = run;
+    run.catch(() => {
+      if (betaChannelPreparationRef.current === run)
+        betaChannelPreparationRef.current = null;
+    });
+    return run;
+  }, []);
+
+  /** 登录态落地后为 xd 组织尝试打开设备级 beta；不阻塞主界面。 */
+  const scheduleXdOrgBetaDefault = useCallback(
+    (token: string, expectedAuthGeneration: number) => {
+      if (!IS_OTA_SELFHOST) return;
+      const currentUser = userRef.current;
+      if (!currentUser) return;
+      const expectedUserId = currentUser.id;
+      void (async () => {
+        await prepareBetaChannelForCurrentDevice();
+        await maybeEnableXdOrgBetaDefault(
+          {
+            expectedAuthGeneration,
+            expectedUserId,
+            user: {
+              membershipKind: currentUser.membershipKind,
+              orgSlug: decodeJwtOrgSlug(token),
+              orgName: currentUser.orgName,
+            },
+          },
+          {
+            readCurrentAuthIdentity: () => ({
+              authGeneration: authGenerationRef.current,
+              userId: userRef.current?.id ?? null,
+            }),
+            readChannelState: readBetaChannelState,
+            probeBetaManifest: () =>
+              probeBetaChannel(Platform.OS === 'android' ? 'android' : 'ios'),
+            enableBeta: () =>
+              enableUncustomizedBetaChannel(
+                () =>
+                  authGenerationRef.current === expectedAuthGeneration &&
+                  userRef.current?.id === expectedUserId,
+              ),
+          },
+        );
+      })().catch(() => undefined);
+    },
+    [prepareBetaChannelForCurrentDevice],
   );
 
   const serializeRefreshTokenMutation = useCallback(
@@ -532,6 +606,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       );
       sessionRecoverySuspendedRef.current = false;
       scheduleCanaryChannelSync(outcome.accessToken, generation);
+      scheduleXdOrgBetaDefault(outcome.accessToken, generation);
       updateLoginState(
         reduceAuthFlow(loginStateRef.current, { type: 'outcome', outcome }),
       );
@@ -546,6 +621,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       loadMe,
       persistAccountDeletionReceipt,
       scheduleCanaryChannelSync,
+      scheduleXdOrgBetaDefault,
       serializeRefreshTokenMutation,
       setToken,
       updateLoginState,
@@ -594,6 +670,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             mergeMembershipWithExisting(pair.membership, userRef.current),
           );
           scheduleCanaryChannelSync(pair.accessToken, generation);
+          scheduleXdOrgBetaDefault(pair.accessToken, generation);
           void loadMe(pair.accessToken, did, generation).catch(() => undefined);
           return pair.accessToken;
         } catch (error) {
@@ -613,6 +690,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       applyUser,
       loadMe,
       scheduleCanaryChannelSync,
+      scheduleXdOrgBetaDefault,
       serializeRefreshTokenMutation,
       setToken,
     ],
@@ -623,7 +701,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const run = async () => {
       setIsBusy(true);
       try {
-        const did = await ensureDeviceId();
+        const did = await prepareBetaChannelForCurrentDevice();
         if (cancelled || sessionRecoverySuspendedRef.current) return;
         deviceIdRef.current = did;
         setDeviceId(did);
@@ -745,7 +823,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [refresh]);
+  }, [prepareBetaChannelForCurrentDevice, refresh]);
 
   // 降级会话自愈:已安全发布的缓存用户，或因跨区清单失败而延迟发布的会话，
   // 都以退避节奏和回前台时机重试。
@@ -814,8 +892,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // 账号标识 —— initialized 变 true 时迁移必然已经落盘。
   useEffect(() => {
     if (!initialized) return;
-    if (user?.id) void setTapdbUser(user.id);
-    else void clearTapdbUser();
+    if (user?.id) {
+      void setTapdbUser(user.id);
+      // THEMIS 安全 SDK 上报绑定用户 ID(构建期注入原生模块,缺模块时静默降级)。
+      // 用 requireNativeModule 而非 require('xdt-themis'):前者是 expo-modules-core
+      // 的运行时查找(不受 Metro 静态解析影响),模块缺失时抛出可捕获的错误。
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call,@typescript-eslint/no-unsafe-member-access
+        requireNativeModule('XdtThemis').addCustomField('playerinfo', String(user.id));
+      } catch {
+        // xdt-themis is build-time injected; absent in dev / unconfigured regions.
+      }
+    } else {
+      void clearTapdbUser();
+      // 登出时清除 THEMIS 用户绑定,避免崩溃/强杀上报误归于上一个账号。
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call,@typescript-eslint/no-unsafe-member-access
+        requireNativeModule('XdtThemis').addCustomField('playerinfo', '');
+      } catch {
+        // xdt-themis is build-time injected; absent in dev / unconfigured regions.
+      }
+    }
   }, [initialized, user?.id]);
 
   // 词典缓存的落盘键按账号分区。登出清理是尽力而为的(索引可能读不出来),分区让
@@ -915,7 +1012,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setIsBusy(true);
         setAuthError(null);
         try {
-          const did = deviceIdRef.current ?? (await ensureDeviceId());
+          const did =
+            deviceIdRef.current ?? (await prepareBetaChannelForCurrentDevice());
           deviceIdRef.current = did;
           setDeviceId(did);
           const startsBuildRealmFlow =
@@ -1006,6 +1104,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             ) {
               throw authCodeError('INVALID_AUTH_ACTION');
             }
+            const sole = soleAutoStartSsoMethod(confirmation.methods);
+            if (sole) {
+              return startBrowserAuthorization({
+                previousState: confirmation,
+                kind: 'sso',
+                providerOrConnectionId: sole.connectionId,
+                label: sole.connectionName || sole.orgName,
+              });
+            }
             updateLoginState(
               reduceAuthFlow(confirmation, {
                 type: 'discovery-loaded',
@@ -1036,8 +1143,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
               did,
               BUILD_AUTH_REGION,
             ).discover(email);
+            const currentState = loginStateRef.current;
+            const sole = soleLoginMethod(methods);
+            if (sole?.type === 'sso' && currentState) {
+              return startBrowserAuthorization({
+                previousState: currentState,
+                kind: 'sso',
+                providerOrConnectionId: sole.connectionId,
+                label: sole.connectionName || sole.orgName,
+              });
+            }
+            if (sole?.type === 'email_code') {
+              await authClientFor(did, BUILD_AUTH_REGION).requestCode(
+                'email',
+                email,
+              );
+              updateLoginState(
+                reduceAuthFlow(currentState, {
+                  type: 'code-requested',
+                  kind: 'email',
+                  identifier: email,
+                }),
+              );
+              return true;
+            }
             updateLoginState(
-              reduceAuthFlow(loginStateRef.current, {
+              reduceAuthFlow(currentState, {
                 type: 'discovery-loaded',
                 email,
                 methods,
@@ -1045,8 +1176,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             );
             return true;
           }
-          // 企业 SSO 入口（按组织 ID/slug/已验证域名）：结果映射进 method-choice，
-          // 复用连接选择 UI 与 start-sso 流程。
+          // 企业 SSO 入口（按组织 ID/slug/已验证域名）：唯一连接直接进浏览器；
+          // 多连接才映射进 method-choice，复用连接选择 UI 与 start-sso 流程。
           if (action.type === 'discover-sso-org') {
             const org = action.org.trim().toLowerCase();
             // 新的一次组织发现不得复用上一轮成功结果；只有本轮双区判定成功后
@@ -1098,6 +1229,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
                 }),
               );
             } else {
+              const sole = soleAutoStartSsoMethod(methods);
+              if (sole && currentState) {
+                return startBrowserAuthorization({
+                  previousState: currentState,
+                  kind: 'sso',
+                  providerOrConnectionId: sole.connectionId,
+                  label: sole.connectionName || sole.orgName,
+                });
+              }
               updateLoginState(
                 reduceAuthFlow(currentState, {
                   type: 'discovery-loaded',
@@ -1293,6 +1433,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [
       acceptOutcome,
       completeOAuthCallback,
+      prepareBetaChannelForCurrentDevice,
       suspendSessionRecoveryForLogin,
       updateLoginState,
     ],
@@ -1305,12 +1446,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // 残留由 server 侧 APNs 410 回收与换账号重注册的让位逻辑兜底。
     // Invalidate in-flight remote creates before any async logout cleanup begins.
     setMobileAuthOwner(null);
+    // 同步失效认证代次，必须早于第一个 await。否则推送 token 注销的网络等待窗口内，
+    // 迟到的 canary / XD beta 探测仍会把旧账号结果写回本地。
+    authGenerationRef.current += 1;
+    refreshInFlightRef.current = null;
     await unregisterPushTokenBestEffort(
       accessTokenRef.current,
       activeAuthRealmRef.current,
     );
-    authGenerationRef.current += 1;
-    refreshInFlightRef.current = null;
     setToken(null);
     applyUser(null);
     updateLoginState(null);

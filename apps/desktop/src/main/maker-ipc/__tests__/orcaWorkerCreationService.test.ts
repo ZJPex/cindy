@@ -1778,7 +1778,7 @@ describe('OrcaWorkerCreationService', () => {
     }));
   });
 
-  it('persists the default route while validating connected sources when only the worker model is explicit', async () => {
+  it('pins the sole runtime provider when only the worker model is explicit', async () => {
     const availability = {
       'claude-code': [],
       codex: [
@@ -1806,6 +1806,41 @@ describe('OrcaWorkerCreationService', () => {
     expect(deps.buildCreateOptsWithStderr).toHaveBeenCalledWith(expect.objectContaining({
       providerId: 'xd',
       model: 'gpt-5.4',
+    }));
+  });
+
+  it('uses the sole XD catalog route for an explicit DeepSeek model instead of Codex native auth', async () => {
+    const model = 'deepseek/deepseek-v4-pro';
+    const { deps, service } = createDeps({
+      getAvailableModels: vi.fn(() => [
+        { id: model, efforts: ['high'], defaultEffort: 'high', supportsFastMode: false },
+      ]),
+      getProviderRoutingContext: vi.fn(async () => providerRoutingContext({
+        'claude-code': [],
+        codex: [{
+          id: 'xd',
+          name: 'XD Gateway',
+          models: [model],
+          // gateway-key 不属于 requiresExplicitRoute；唯一来源仍必须固化。
+          requiresExplicitRoute: false,
+        }],
+      })),
+    });
+
+    await expect(service.createWorker({
+      leadSessionId: 'lead-1',
+      role: 'developer',
+      agent: 'codex',
+      label: 'deepseek_worker',
+      model,
+    })).resolves.toMatchObject({
+      ok: true,
+      resolved: { model, providerId: 'xd' },
+    });
+
+    expect(deps.buildCreateOptsWithStderr).toHaveBeenCalledWith(expect.objectContaining({
+      model,
+      providerId: 'xd',
     }));
   });
 
@@ -2103,7 +2138,7 @@ describe('buildNoProviderMessage', () => {
     }));
   });
 
-  it('treats an empty-string providerId as not-explicit and persists the resolved route', async () => {
+  it('treats an empty-string providerId as not-explicit and pins a sole runtime source', async () => {
     const { service } = createDeps();
 
     await expect(service.createWorker({
@@ -2115,7 +2150,7 @@ describe('buildNoProviderMessage', () => {
       providerId: '',
     })).resolves.toMatchObject({
       ok: true,
-      // 与「显式 model 未显式来源」同语义：不进显式 preflight，但保存实际默认来源。
+      // 空串仍按未显式处理；唯一可用来源由运行时目录解析,不按模型名写死。
       resolved: { providerId: 'xd', model: 'gpt-5.5' },
     });
   });
@@ -2471,9 +2506,10 @@ describe('SSH remote worker model/provider compatibility gate (R23 P2)', () => {
     ).resolves.toMatchObject({ ok: true });
   });
 
-  it('rejects Pi workers for a remote lead before bootstrap (pi sessions are local-only)', async () => {
-    // codex-connector 回归:PiAgent.startSession 对 remoteHostId 一律 NotSupportedError,
-    // 不在 preflight 拒绝会让远程 Lead + Pi 组合在 bootstrap 期落成笼统 INTERNAL。
+  it('allows Pi workers for a remote lead (pi SSH remote runtime landed — round 42)', async () => {
+    // 轮 42:原闸(pi sessions are local-only)写于 Pi SSH remote 能力落地前;
+    // 现 remote pi 全链路可用,worker 继承 lead.remoteHostId 走通用 remote 路径,
+    // preflight 不再拒绝,直接进 bootstrap。
     const { service, deps } = createDeps({
       getLeadSessionRow: vi.fn(async () => remoteLeadRow),
       getProviderRoutingContext: vi.fn(async () => providerRoutingContext({
@@ -2482,19 +2518,22 @@ describe('SSH remote worker model/provider compatibility gate (R23 P2)', () => {
         pi: [{ id: 'xd', name: 'XD Gateway', models: ['claude-sonnet-4-6'] }],
       })),
     });
-    await expect(
-      service.createWorker({
-        leadSessionId: 'lead-1',
-        role: 'developer',
-        agent: 'pi',
-        label: 'pi-dev',
-      }),
-    ).resolves.toMatchObject({
-      ok: false,
-      errorCode: 'INVALID_PARAMS',
-      message: expect.stringContaining('local-only'),
+    const result = await service.createWorker({
+      leadSessionId: 'lead-1',
+      role: 'developer',
+      agent: 'pi',
+      label: 'pi-dev',
     });
-    expect(deps.bootstrapSession).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ ok: true });
+    // worker bootstrap 继承 lead 的 remoteHostId + workingDir(同远端主机 spawn)。
+    expect(deps.bootstrapSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentKind: 'pi',
+        remoteHostId: 'remote-host-1',
+        workingDir: '/srv/repo',
+        orcaRole: 'worker',
+      }),
+    );
   });
 });
 

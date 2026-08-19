@@ -117,6 +117,14 @@ export interface ResolveRenderPinArgs {
   restoring: boolean;
   /** The current render introduced a new user message at the tail. */
   newUserSend: boolean;
+  /**
+   * The tail user message was sent from this renderer's composer (local send,
+   * edit-resend, or a device-link send initiated on this desktop). User
+   * messages injected by other entries (IM channels, a mobile client driving
+   * the session remotely, scheduler runs) arrive over IPC with no local
+   * composer intent and must not steal the viewport (#2194).
+   */
+  sentFromThisRenderer: boolean;
   /** Auto-follow was active before this render. */
   nearBottom: boolean;
 }
@@ -169,16 +177,65 @@ export function resolveLastUserMessageObservation({
 /**
  * Resolve the render-time priority between a saved history anchor and auto-follow.
  * Reopening a session must preserve a real reading position, but a user message
- * sent during that mounted session is an explicit request to resume at the tail.
+ * sent from this renderer during that mounted session is an explicit request to
+ * resume at the tail. A user message injected by another entry (IM channel,
+ * mobile client, scheduler) carries no such intent: it follows the ordinary
+ * rule — pin only while the user is still near the bottom.
  */
 export function resolveRenderPinDecision({
   restoring,
   newUserSend,
   nearBottom,
+  sentFromThisRenderer,
 }: ResolveRenderPinArgs): ResolveRenderPinDecision {
-  if (newUserSend) return { clearRestoring: restoring, pinToBottom: true };
+  if (newUserSend && sentFromThisRenderer) {
+    return { clearRestoring: restoring, pinToBottom: true };
+  }
   if (restoring) return { clearRestoring: false, pinToBottom: false };
   return { clearRestoring: false, pinToBottom: nearBottom };
+}
+
+export interface ResolveSendWindowHandoffArgs {
+  /** The current render introduced a new user message at the tail. */
+  isNewUserSend: boolean;
+  /** The tail user message was sent from this renderer's composer. */
+  sentFromThisRenderer: boolean;
+  /** The stream is currently showing an anchored (non-default-tail) window. */
+  hasWindowAnchor: boolean;
+  /** The current bounded window already includes the real session tail. */
+  windowCoversEnd: boolean;
+}
+
+export interface ResolveSendWindowHandoff {
+  /** Local send while reading an anchored window: switch back to the default tail. */
+  clearWindowAnchor: boolean;
+  /**
+   * The current visible slice does not include the real tail, so pinning this
+   * frame would land on the old slice. Wait for the next render's tail window.
+   */
+  deferPinToNextRender: boolean;
+}
+
+/**
+ * After a local send, leave any historical render window so later assistant /
+ * tool items keep auto-following the real tail.
+ *
+ * An anchored window that still covers the end at send time would otherwise
+ * stay anchored; the next appended items flip `windowCoversEnd` to false and
+ * the stream treats that as "left the bottom", stopping follow. External
+ * injections must not take this handoff (#2194).
+ */
+export function resolveSendWindowHandoff({
+  isNewUserSend,
+  sentFromThisRenderer,
+  hasWindowAnchor,
+  windowCoversEnd,
+}: ResolveSendWindowHandoffArgs): ResolveSendWindowHandoff {
+  const clearWindowAnchor = isNewUserSend && sentFromThisRenderer && hasWindowAnchor;
+  return {
+    clearWindowAnchor,
+    deferPinToNextRender: clearWindowAnchor && !windowCoversEnd,
+  };
 }
 
 export interface ResolveNearBottomArgs {
@@ -197,8 +254,10 @@ export interface ResolveNearBottomArgs {
 /**
  * scroll 事件驱动的跟随态迁移(handleScroll 消费)。
  *
- *  - 距底 >= threshold → false。离底解除,原有行为不变 — 这也是滚动条拖拽
- *    (没有 wheel 事件可听)的解除兜底。
+ *  - 距底 >= threshold 且(已解除, 或明确上滚) → false。这是滚动条拖拽
+ *    等无 wheel 路径的解除兜底。**已在跟、却只是内容在下方长高**
+ *    (发送后首块 assistant / 工具卡撑高、迟到的程序化 scroll 事件)
+ *    不得解除 — pin / ResizeObserver 会补上。
  *  - 距底 < threshold 且原本在跟 → 保持 true。阈值带内的微小上移不在这里
  *    解除(滚动条微拖、布局收缩钳位等 scrollTop 被动上移会误伤),wheel /
  *    touch / 键盘的意图解除路径已经覆盖了真实的用户上滚。
@@ -213,7 +272,10 @@ export function resolveNearBottomOnScroll({
   thresholdPx,
   directionDeadZonePx,
 }: ResolveNearBottomArgs): boolean {
-  if (distanceFromBottom >= thresholdPx) return false;
+  if (distanceFromBottom >= thresholdPx) {
+    if (!wasNearBottom) return false;
+    return scrollDelta >= -directionDeadZonePx;
+  }
   if (wasNearBottom) return true;
   return scrollDelta > directionDeadZonePx;
 }

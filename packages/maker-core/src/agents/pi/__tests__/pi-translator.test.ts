@@ -10,6 +10,7 @@ import type { AgentEvent } from '../../../types/events.js';
 import type { AsyncQueue } from '../../shared/async-queue.js';
 import type { Logger } from '../../../interfaces/logger.js';
 import type { PiRpcEvent } from '../rpc-client.js';
+import { makeGhostManual64KiBFixture } from '../../shared/ghost-manual-fixture.js';
 
 const noopLogger: Logger = {
   trace: () => {},
@@ -159,6 +160,295 @@ describe('pi translator', () => {
     ]);
   });
 
+  it('does not emit a leaked Grok stop token split across PI deltas', () => {
+    const ctx = createPiTranslateContext(noopLogger);
+    const { queue, events } = makeQueue();
+
+    translatePiEvent(ev({ type: 'message_start' }), queue, ctx);
+    translatePiEvent(
+      ev({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: '<|eo' },
+      }),
+      queue,
+      ctx,
+    );
+    translatePiEvent(
+      ev({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'text_delta', contentIndex: 1, delta: 'answer' },
+      }),
+      queue,
+      ctx,
+    );
+    translatePiEvent(
+      ev({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: 's|>' },
+      }),
+      queue,
+      ctx,
+    );
+    translatePiEvent(
+      ev({
+        type: 'message_end',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: '<|eos|>' },
+            { type: 'text', text: 'answer' },
+          ],
+          model: 'xai/grok-4.6',
+          stopReason: 'stop',
+        },
+      }),
+      queue,
+      ctx,
+    );
+
+    expect(events.filter((event) => event.type === 'text')).toEqual([
+      { type: 'text', data: { text: 'answer', isFinal: false }, source: 'pi' },
+      expect.objectContaining({
+        type: 'text',
+        data: { text: 'answer', isFinal: true, isFullText: true },
+        source: 'pi',
+      }),
+    ]);
+  });
+
+  it('does not emit a leaked Grok stop token split as a single-character prefix', () => {
+    const ctx = createPiTranslateContext(noopLogger);
+    const { queue, events } = makeQueue();
+
+    translatePiEvent(ev({ type: 'message_start' }), queue, ctx);
+    translatePiEvent(
+      ev({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: '<' },
+      }),
+      queue,
+      ctx,
+    );
+    translatePiEvent(
+      ev({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: '|eos|>' },
+      }),
+      queue,
+      ctx,
+    );
+    translatePiEvent(
+      ev({
+        type: 'message_end',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: '<|eos|>' }],
+          model: 'xai/grok-4.6',
+          stopReason: 'stop',
+        },
+      }),
+      queue,
+      ctx,
+    );
+
+    expect(events.filter((event) => event.type === 'text')).toEqual([]);
+  });
+
+  it('surfaces a terminal provider error after Pi settles instead of staying in Working', () => {
+    const ctx = createPiTranslateContext(noopLogger);
+    const { queue, events } = makeQueue();
+    const rawError =
+      'HTTP 400: third-party apps draw from extra usage. Authorization: Bearer secret-token';
+
+    translatePiEvent(ev({ type: 'agent_start' }), queue, ctx);
+    translatePiEvent(
+      ev({
+        type: 'message_end',
+        message: {
+          role: 'assistant',
+          content: [],
+          stopReason: 'error',
+          errorMessage: rawError,
+          usage: { input: 0, output: 0 },
+        },
+      }),
+      queue,
+      ctx,
+    );
+
+    expect(events.filter((event) => event.type === 'error')).toHaveLength(0);
+    translatePiEvent(ev({ type: 'agent_settled' }), queue, ctx);
+
+    const errors = events.filter((event) => event.type === 'error');
+    expect(errors).toEqual([
+      expect.objectContaining({
+        source: 'pi',
+        data: expect.objectContaining({
+          message: 'HTTP 400: third-party apps draw from extra usage. Authorization: [REDACTED]',
+          isTerminal: true,
+        }),
+      }),
+    ]);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'done', source: 'pi' }));
+    expect(events.at(-1)).toEqual(expect.objectContaining({
+      type: 'status',
+      data: expect.objectContaining({ status: 'Done', isRunning: false }),
+    }));
+  });
+
+  it('drops a pending provider error when Pi auto-retry succeeds', () => {
+    const ctx = createPiTranslateContext(noopLogger);
+    const { queue, events } = makeQueue();
+
+    translatePiEvent(ev({ type: 'agent_start' }), queue, ctx);
+    translatePiEvent(
+      ev({
+        type: 'message_end',
+        message: {
+          role: 'assistant',
+          content: [],
+          stopReason: 'error',
+          errorMessage: 'HTTP status 529: overloaded',
+        },
+      }),
+      queue,
+      ctx,
+    );
+    translatePiEvent(
+      ev({
+        type: 'auto_retry_start',
+        attempt: 1,
+        maxAttempts: 3,
+        errorMessage: 'HTTP status 529: overloaded',
+      }),
+      queue,
+      ctx,
+    );
+    translatePiEvent(
+      ev({
+        type: 'message_end',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Recovered answer' }],
+          stopReason: 'stop',
+        },
+      }),
+      queue,
+      ctx,
+    );
+    translatePiEvent(ev({ type: 'auto_retry_end', success: true }), queue, ctx);
+    translatePiEvent(ev({ type: 'agent_settled' }), queue, ctx);
+
+    // 第一次自动重试保持静默：一次抖动就恢复时不该闪红色错误条。
+    expect(events.filter((event) => event.type === 'error')).toHaveLength(0);
+    expect((events.find((event) => event.type === 'done')?.data as { result?: string }).result)
+      .toBe('Recovered answer');
+  });
+
+  it('maps later Pi auto-retries onto the shared overload retry protocol', () => {
+    const ctx = createPiTranslateContext(noopLogger);
+    const { queue, events } = makeQueue();
+
+    translatePiEvent(ev({ type: 'agent_start' }), queue, ctx);
+    translatePiEvent(
+      ev({
+        type: 'auto_retry_start',
+        attempt: 2,
+        maxAttempts: 3,
+        errorMessage: 'HTTP status 529: overloaded',
+      }),
+      queue,
+      ctx,
+    );
+
+    expect(events.filter((event) => event.type === 'error')).toEqual([
+      expect.objectContaining({
+        type: 'error',
+        source: 'pi',
+        data: expect.objectContaining({
+          message: 'HTTP status 529: overloaded (auto-retry 2/3)',
+          isTerminal: false,
+          willRetry: true,
+          reason: 'upstream-overload',
+          errorStatus: 529,
+        }),
+      }),
+    ]);
+  });
+
+  it('keeps unclassified Pi auto-retries silent instead of reusing the overload marker', () => {
+    const ctx = createPiTranslateContext(noopLogger);
+    const { queue, events } = makeQueue();
+
+    translatePiEvent(
+      ev({
+        type: 'auto_retry_start',
+        attempt: 2,
+        maxAttempts: 3,
+        errorMessage: 'provider 500 from upstream',
+      }),
+      queue,
+      ctx,
+    );
+
+    expect(events.filter((event) => event.type === 'error')).toHaveLength(0);
+  });
+
+  it('does not duplicate a terminal error after Pi auto-retry is exhausted', () => {
+    const ctx = createPiTranslateContext(noopLogger);
+    const { queue, events } = makeQueue();
+
+    translatePiEvent(ev({ type: 'agent_start' }), queue, ctx);
+    translatePiEvent(
+      ev({
+        type: 'message_end',
+        message: {
+          role: 'assistant',
+          content: [],
+          stopReason: 'error',
+          errorMessage: 'initial provider error',
+        },
+      }),
+      queue,
+      ctx,
+    );
+    translatePiEvent(
+      ev({ type: 'auto_retry_end', success: false, finalError: 'final provider error' }),
+      queue,
+      ctx,
+    );
+    translatePiEvent(ev({ type: 'agent_settled' }), queue, ctx);
+
+    const terminalErrors = events.filter(
+      (event) =>
+        event.type === 'error' &&
+        (event.data as { isTerminal?: boolean }).isTerminal === true,
+    );
+    expect(terminalErrors).toHaveLength(1);
+    expect(terminalErrors[0]?.data).toMatchObject({ message: 'final provider error' });
+  });
+
+  it('preserves a 64KB ghost_manual envelope only as tool_result data', () => {
+    const { content, wire } = makeGhostManual64KiBFixture();
+    expect(Buffer.byteLength(wire, 'utf8')).toBeGreaterThan(64 * 1024);
+
+    const ctx = createPiTranslateContext(noopLogger);
+    const { queue, events } = makeQueue();
+    translatePiEvent(
+      ev({
+        type: 'tool_execution_end',
+        toolCallId: 'manual-call',
+        toolName: 'ghost_manual',
+        result: { content: [{ type: 'text', text: wire }] },
+      }),
+      queue,
+      ctx,
+    );
+    const full = events.find((event) => event.type === 'tool_result_full');
+    expect(full).toMatchObject({ data: { fullText: wire }, source: 'pi' });
+    expect(JSON.parse((full!.data as { fullText: string }).fullText).content).toBe(content);
+  });
+
   it('maps compaction_end (threshold) → compact_boundary with token deltas + updates contextTokens', () => {
     const ctx = createPiTranslateContext(noopLogger);
     const { queue, events } = makeQueue();
@@ -174,6 +464,19 @@ describe('pi translator', () => {
     expect(data.preTokens).toBe(150000);
     expect(data.postTokens).toBe(32000);
     expect(ctx.contextTokens).toBe(32000);
+  });
+
+  it('labels host-triggered compact RPC as auto even when Pi reports reason=manual', () => {
+    const ctx = createPiTranslateContext(noopLogger);
+    ctx.hostAutoCompactInFlight = true;
+    const { queue, events } = makeQueue();
+    translatePiEvent(
+      ev({ type: 'compaction_end', reason: 'manual', result: { tokensBefore: 160000, estimatedTokensAfter: 20000 } }),
+      queue,
+      ctx,
+    );
+    const data = events.find((e) => e.type === 'compact_boundary')!.data as { trigger: string };
+    expect(data.trigger).toBe('auto');
   });
 
   it('maps manual compaction trigger through to compact_boundary', () => {
@@ -236,6 +539,37 @@ describe('pi translator', () => {
       ctx2,
     );
     expect(ev2.filter((e) => e.type === 'status')).toHaveLength(0);
+  });
+
+  it('does not emit compact_boundary for aborted or failed compaction_end', () => {
+    const ctx = createPiTranslateContext(noopLogger);
+    const { queue, events } = makeQueue();
+    translatePiEvent(ev({ type: 'compaction_start', reason: 'threshold' }), queue, ctx);
+    translatePiEvent(
+      ev({ type: 'compaction_end', reason: 'threshold', result: null, aborted: true }),
+      queue,
+      ctx,
+    );
+    expect(events.some((e) => e.type === 'compact_boundary')).toBe(false);
+
+    const ctx2 = createPiTranslateContext(noopLogger);
+    const { queue: q2, events: ev2 } = makeQueue();
+    translatePiEvent(
+      ev({
+        type: 'compaction_end',
+        reason: 'manual',
+        result: null,
+        aborted: false,
+        errorMessage: 'quota exceeded',
+      }),
+      q2,
+      ctx2,
+    );
+    expect(ev2.some((e) => e.type === 'compact_boundary')).toBe(false);
+    const endStatus = ev2.find(
+      (e) => e.type === 'status' && (e.data as { isRunning?: boolean }).isRunning === false,
+    );
+    expect(endStatus).toBeDefined();
   });
 
   it('accumulates turn usage and attaches it to the done event on agent_settled', () => {
