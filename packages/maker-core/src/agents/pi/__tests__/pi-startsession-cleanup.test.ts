@@ -250,6 +250,10 @@ describe('PiAgent.startSession failure cleanup (mocked pi process)', () => {
 
   function emitConfirmedDegenerateOutput(): void {
     knobs.onEvent?.({ type: 'agent_start' });
+    emitConfirmedDegenerateMessage();
+  }
+
+  function emitConfirmedDegenerateMessage(): void {
     knobs.onEvent?.({ type: 'message_start' });
     const repeated = 'let me write the file now; 现在执行；落地。'.repeat(1_100);
     knobs.onEvent?.({
@@ -606,6 +610,78 @@ describe('PiAgent.startSession failure cleanup (mocked pi process)', () => {
       },
     });
     await vi.waitFor(() => expect(knobs.requests.filter((type) => type === 'abort')).toHaveLength(1));
+
+    await handle.close();
+  });
+
+  it('keeps a bypassed follow-up ahead of a queued protected turn', async () => {
+    const deepSeekModel = 'DeepSeek-V4-Flash-0731';
+    const handle = await new PiAgent(buildDeps({
+      capabilityAdditions: {
+        availableModels: [{
+          id: deepSeekModel,
+          displayName: deepSeekModel,
+          contextWindow: 200_000,
+          efforts: [],
+          defaultEffort: null,
+        }],
+      },
+    })).startSession({ ...opts(), model: deepSeekModel });
+
+    knobs.onEvent?.({ type: 'agent_start' });
+    await handle.send({
+      type: 'user',
+      content: '/allow-repetitive-output\nRepeat the fixture exactly as requested.',
+    });
+    await handle.send({ type: 'user', content: 'Normal protected follow-up.' });
+    knobs.onEvent?.({ type: 'agent_settled' });
+
+    knobs.requests = [];
+    knobs.onEvent?.({ type: 'agent_start' });
+    emitConfirmedDegenerateMessage();
+    expect(knobs.requests.filter((type) => type === 'abort')).toHaveLength(0);
+    knobs.onEvent?.({ type: 'agent_settled' });
+
+    knobs.requests = [];
+    knobs.onEvent?.({ type: 'agent_start' });
+    emitConfirmedDegenerateMessage();
+    await vi.waitFor(() => expect(knobs.requests.filter((type) => type === 'abort')).toHaveLength(1));
+
+    await handle.close();
+  });
+
+  it('keeps a protected follow-up ahead of a queued bypassed turn', async () => {
+    const deepSeekModel = 'DeepSeek-V4-Flash-0731';
+    const handle = await new PiAgent(buildDeps({
+      capabilityAdditions: {
+        availableModels: [{
+          id: deepSeekModel,
+          displayName: deepSeekModel,
+          contextWindow: 200_000,
+          efforts: [],
+          defaultEffort: null,
+        }],
+      },
+    })).startSession({ ...opts(), model: deepSeekModel });
+
+    knobs.onEvent?.({ type: 'agent_start' });
+    await handle.send({ type: 'user', content: 'Normal protected follow-up.' });
+    await handle.send({
+      type: 'user',
+      content: '/allow-repetitive-output\nRepeat the fixture exactly as requested.',
+    });
+    knobs.onEvent?.({ type: 'agent_settled' });
+
+    knobs.requests = [];
+    knobs.onEvent?.({ type: 'agent_start' });
+    emitConfirmedDegenerateMessage();
+    await vi.waitFor(() => expect(knobs.requests.filter((type) => type === 'abort')).toHaveLength(1));
+    knobs.onEvent?.({ type: 'agent_settled' });
+
+    knobs.requests = [];
+    knobs.onEvent?.({ type: 'agent_start' });
+    emitConfirmedDegenerateMessage();
+    expect(knobs.requests.filter((type) => type === 'abort')).toHaveLength(0);
 
     await handle.close();
   });

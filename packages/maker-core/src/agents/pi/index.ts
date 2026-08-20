@@ -2170,9 +2170,16 @@ export class PiAgent extends BaseAgent {
     // follow-up send)同口径。清空只认 turn 终态,由 send 预检覆盖为最新值。
     let activeTurnPermissionPolicy: TurnPermissionPolicy | null = null;
     let mutableModel = opts.model;
-    // 用户显式放行只对下一条 Pi agent turn 生效。pending 与 active 分开，避免 streaming
-    // 中排队 followUp 时提前改变当前 turn 的保护状态。
-    let pendingOutputDegenerationBypass: boolean | null = null;
+    // 用户显式放行只对对应的 Pi agent turn 生效。每个已发起的 prompt 独立排队，避免
+    // streaming 中连续 followUp 互相覆盖；对象身份让明确拒绝的 prompt 只撤销自己。
+    type OutputDegenerationBypassReservation = { allowRepetitiveOutput: boolean };
+    const pendingOutputDegenerationBypasses: OutputDegenerationBypassReservation[] = [];
+    const discardOutputDegenerationBypass = (
+      reservation: OutputDegenerationBypassReservation,
+    ): void => {
+      const index = pendingOutputDegenerationBypasses.indexOf(reservation);
+      if (index >= 0) pendingOutputDegenerationBypasses.splice(index, 1);
+    };
     let activeOutputDegenerationBypass = false;
     let mutableWireModel = initialWireModel;
     // Pi RPC 实际选中的 provider。与用于宿主鉴权/审阅元数据的 mutableProviderId 分开：
@@ -2537,8 +2544,8 @@ export class PiAgent extends BaseAgent {
         logger: this.deps.logger,
         onEvent: (event: PiRpcEvent) => {
           if (event.type === 'agent_start') {
-            activeOutputDegenerationBypass = pendingOutputDegenerationBypass ?? false;
-            pendingOutputDegenerationBypass = null;
+            activeOutputDegenerationBypass =
+              pendingOutputDegenerationBypasses.shift()?.allowRepetitiveOutput ?? false;
           }
           outputDegenerationProtection.onEvent(event);
           if (event.type === 'agent_start' || event.type === 'agent_settled') {
@@ -3622,8 +3629,10 @@ export class PiAgent extends BaseAgent {
             ? await readPiUserEntryIds()
             : null;
           if (!managedPackageRoute.accepted) rejectIfCancelled(sendOpts, 'send');
-          const previousPendingOutputDegenerationBypass = pendingOutputDegenerationBypass;
-          pendingOutputDegenerationBypass = outputDegenerationDirective.allowRepetitiveOutput;
+          const outputDegenerationBypassReservation = {
+            allowRepetitiveOutput: outputDegenerationDirective.allowRepetitiveOutput,
+          };
+          pendingOutputDegenerationBypasses.push(outputDegenerationBypassReservation);
           promptRequestStarted = true;
           try {
             const resp = await runExclusivePiRpc(() => proc.request(command, {
@@ -3636,6 +3645,7 @@ export class PiAgent extends BaseAgent {
             }));
             if (!resp.success) {
               if (managedPackageRoute.accepted) {
+                discardOutputDegenerationBypass(outputDegenerationBypassReservation);
                 // The host-owned package mutation and its deterministic visible
                 // receipt already crossed the dispatch boundary. The follow-up
                 // prompt only lets Pi/model restate that receipt; rejecting it
@@ -3704,6 +3714,7 @@ export class PiAgent extends BaseAgent {
                   data.isCompacting !== true &&
                   (typeof data.pendingMessageCount !== 'number' || data.pendingMessageCount === 0);
                 if (runtimeIdle && piAgentLifecycleSequence === lifecycleSequenceBeforePrompt) {
+                  discardOutputDegenerationBypass(outputDegenerationBypassReservation);
                   const result = capturedExtensionNotifications?.join('\n\n') ?? '';
                   // prompt success is only the RPC acceptance boundary. Let
                   // handle.send() resolve before publishing a synthetic terminal;
@@ -3761,7 +3772,7 @@ export class PiAgent extends BaseAgent {
               activeExtensionCommandNotifications = null;
             }
             if (!providerAccepted) {
-              pendingOutputDegenerationBypass = previousPendingOutputDegenerationBypass;
+              discardOutputDegenerationBypass(outputDegenerationBypassReservation);
             }
           }
         } catch (err) {
