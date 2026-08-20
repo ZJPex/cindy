@@ -382,6 +382,138 @@ describe('PiAgent.startSession failure cleanup (mocked pi process)', () => {
     await handle.close();
   });
 
+  it('aborts one DeepSeek response after the bounded low-entropy guard confirms degeneration', async () => {
+    const deepSeekModel = 'DeepSeek-V4-Flash-0731';
+    const handle = await new PiAgent(buildDeps({
+      capabilityAdditions: {
+        availableModels: [{
+          id: deepSeekModel,
+          displayName: deepSeekModel,
+          contextWindow: 200_000,
+          efforts: [],
+          defaultEffort: null,
+        }],
+      },
+    })).startSession({ ...opts(), model: deepSeekModel });
+    const iterator = handle.events()[Symbol.asyncIterator]();
+    knobs.requests = [];
+
+    knobs.onEvent?.({ type: 'agent_start' });
+    knobs.onEvent?.({ type: 'message_start' });
+    const repeated = 'let me write the file now; 现在执行；落地。'.repeat(1_100);
+    knobs.onEvent?.({
+      type: 'message_update',
+      assistantMessageEvent: {
+        type: 'text_delta',
+        contentIndex: 0,
+        delta: repeated.slice(0, 16_384),
+      },
+    });
+    knobs.onEvent?.({
+      type: 'message_update',
+      assistantMessageEvent: {
+        type: 'text_delta',
+        contentIndex: 0,
+        delta: repeated.slice(16_384, 20_480),
+      },
+    });
+    knobs.onEvent?.({
+      type: 'message_update',
+      assistantMessageEvent: {
+        type: 'text_delta',
+        contentIndex: 0,
+        delta: repeated.slice(20_480),
+      },
+    });
+
+    await vi.waitFor(() => expect(knobs.requests.filter((type) => type === 'abort')).toHaveLength(1));
+    knobs.onEvent?.({
+      type: 'message_end',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: repeated.slice(0, 20_480) }],
+        model: deepSeekModel,
+        stopReason: 'aborted',
+        usage: { output: 8_000 },
+      },
+    });
+    knobs.onEvent?.({ type: 'agent_settled' });
+
+    const events = [];
+    for (let index = 0; index < 10; index += 1) {
+      const next = await iterator.next();
+      if (next.done) break;
+      events.push(next.value);
+      if (
+        next.value.type === 'status'
+        && (next.value.data as { isRunning?: unknown }).isRunning === false
+      ) {
+        break;
+      }
+    }
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'error',
+      source: 'pi',
+      data: expect.objectContaining({
+        reason: 'output-degeneration',
+        isTerminal: true,
+      }),
+    }));
+    expect(events).toContainEqual(expect.objectContaining({ type: 'done', source: 'pi' }));
+
+    await handle.close();
+  });
+
+  it('allows an explicitly requested repetitive Pi turn without weakening the next turn', async () => {
+    const deepSeekModel = 'DeepSeek-V4-Flash-0731';
+    const handle = await new PiAgent(buildDeps({
+      capabilityAdditions: {
+        availableModels: [{
+          id: deepSeekModel,
+          displayName: deepSeekModel,
+          contextWindow: 200_000,
+          efforts: [],
+          defaultEffort: null,
+        }],
+      },
+    })).startSession({ ...opts(), model: deepSeekModel });
+    const repeated = 'intentional repeated fixture; '.repeat(1_100);
+
+    await handle.send({
+      type: 'user',
+      content: '/allow-repetitive-output\nRepeat the fixture exactly as requested.',
+    });
+    knobs.requests = [];
+    knobs.onEvent?.({ type: 'agent_start' });
+    knobs.onEvent?.({ type: 'message_start' });
+    knobs.onEvent?.({
+      type: 'message_update',
+      assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: repeated },
+    });
+    expect(knobs.requests).not.toContain('abort');
+    knobs.onEvent?.({ type: 'agent_settled' });
+
+    await handle.send({ type: 'user', content: 'Normal protected turn.' });
+    knobs.requests = [];
+    knobs.onEvent?.({ type: 'agent_start' });
+    knobs.onEvent?.({ type: 'message_start' });
+    knobs.onEvent?.({
+      type: 'message_update',
+      assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: repeated },
+    });
+    knobs.onEvent?.({
+      type: 'message_update',
+      assistantMessageEvent: {
+        type: 'text_delta',
+        contentIndex: 0,
+        delta: 'intentional repeated fixture; '.repeat(100),
+      },
+    });
+    await vi.waitFor(() => expect(knobs.requests.filter((type) => type === 'abort')).toHaveLength(1));
+
+    await handle.close();
+  });
+
   it('keeps local runtime files until a close retry confirms process exit', async () => {
     knobs.closeFailuresRemaining = 1;
     const handle = await new PiAgent(buildDeps()).startSession(opts());
