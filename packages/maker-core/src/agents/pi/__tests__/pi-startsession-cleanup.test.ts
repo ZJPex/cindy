@@ -248,6 +248,36 @@ describe('PiAgent.startSession failure cleanup (mocked pi process)', () => {
     model: 'm',
   });
 
+  function emitConfirmedDegenerateOutput(): void {
+    knobs.onEvent?.({ type: 'agent_start' });
+    knobs.onEvent?.({ type: 'message_start' });
+    const repeated = 'let me write the file now; 现在执行；落地。'.repeat(1_100);
+    knobs.onEvent?.({
+      type: 'message_update',
+      assistantMessageEvent: {
+        type: 'text_delta',
+        contentIndex: 0,
+        delta: repeated.slice(0, 16_384),
+      },
+    });
+    knobs.onEvent?.({
+      type: 'message_update',
+      assistantMessageEvent: {
+        type: 'text_delta',
+        contentIndex: 0,
+        delta: repeated.slice(16_384, 20_480),
+      },
+    });
+    knobs.onEvent?.({
+      type: 'message_update',
+      assistantMessageEvent: {
+        type: 'text_delta',
+        contentIndex: 0,
+        delta: repeated.slice(20_480),
+      },
+    });
+  }
+
   it('disposes ctx (and does not close a nonexistent proc) when the process constructor throws synchronously', async () => {
     knobs.ctorThrows = true;
     const agent = new PiAgent(buildDeps());
@@ -461,6 +491,72 @@ describe('PiAgent.startSession failure cleanup (mocked pi process)', () => {
     }));
     expect(events).toContainEqual(expect.objectContaining({ type: 'done', source: 'pi' }));
 
+    await handle.close();
+  });
+
+  it('enables DeepSeek output protection from the resolved wire model', async () => {
+    const publicModel = 'legacy-model';
+    const providerId = 'native-alias';
+    const handle = await new PiAgent(buildDeps({
+      capabilityAdditions: {
+        availableModels: [{
+          id: publicModel,
+          displayName: publicModel,
+          contextWindow: 200_000,
+          efforts: [],
+          defaultEffort: null,
+        }],
+      },
+      resolvePiNativeProviders: async () => ({
+        providers: [{
+          id: providerId,
+          name: 'Native Alias',
+          baseUrl: 'https://native.example.test/v1',
+          api: 'openai-responses',
+          modelIdAliases: { [publicModel]: 'deepseek-native' },
+          models: [{ id: 'deepseek-native', wireId: 'deepseek/deepseek-v4-pro' }],
+        }],
+        env: {},
+      }),
+    })).startSession({ ...opts(), model: publicModel, providerId });
+    knobs.requests = [];
+
+    emitConfirmedDegenerateOutput();
+
+    await vi.waitFor(() => expect(knobs.requests.filter((type) => type === 'abort')).toHaveLength(1));
+    await handle.close();
+  });
+
+  it('does not enable DeepSeek output protection when the wire model is not DeepSeek', async () => {
+    const publicModel = 'deepseek-public';
+    const providerId = 'native-alias';
+    const handle = await new PiAgent(buildDeps({
+      capabilityAdditions: {
+        availableModels: [{
+          id: publicModel,
+          displayName: publicModel,
+          contextWindow: 200_000,
+          efforts: [],
+          defaultEffort: null,
+        }],
+      },
+      resolvePiNativeProviders: async () => ({
+        providers: [{
+          id: providerId,
+          name: 'Native Alias',
+          baseUrl: 'https://native.example.test/v1',
+          api: 'openai-responses',
+          modelIdAliases: { [publicModel]: 'deepseek-native' },
+          models: [{ id: 'deepseek-native', wireId: 'neutral/model-v1' }],
+        }],
+        env: {},
+      }),
+    })).startSession({ ...opts(), model: publicModel, providerId });
+    knobs.requests = [];
+
+    emitConfirmedDegenerateOutput();
+
+    expect(knobs.requests.filter((type) => type === 'abort')).toHaveLength(0);
     await handle.close();
   });
 

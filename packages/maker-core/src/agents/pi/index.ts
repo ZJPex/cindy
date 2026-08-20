@@ -2277,9 +2277,10 @@ export class PiAgent extends BaseAgent {
     let proc: PiRpcProcess;
     const outputDegenerationProtection = new PiOutputDegenerationProtection({
       logger: this.deps.logger.child('output-degeneration'),
-      // 读取 mutableModel 而不是启动快照：会话内 setModel 后下一条消息立即按新模型生效。
+      // 读取实际下发给 Pi 的 mutableWireModel：既遵守 provider alias / wireId，
+      // 也让会话内 setModel 后的下一条消息立即按新模型生效。
       isEnabled: () =>
-        shouldProtectPiOutput(mutableModel) && !activeOutputDegenerationBypass,
+        shouldProtectPiOutput(mutableWireModel) && !activeOutputDegenerationBypass,
       abort: () => proc.request({ type: 'abort' }),
       onDetected: () => markPiOutputDegeneration(ctx),
     });
