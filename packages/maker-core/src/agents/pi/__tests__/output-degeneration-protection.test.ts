@@ -11,7 +11,7 @@ import {
 const ev = (event: Record<string, unknown>): PiRpcEvent => event as unknown as PiRpcEvent;
 
 function loggerWithSpies(): Logger {
-  const logger = {
+  const logger: Logger = {
     trace: vi.fn(),
     debug: vi.fn(),
     info: vi.fn(),
@@ -19,7 +19,7 @@ function loggerWithSpies(): Logger {
     error: vi.fn(),
     fatal: vi.fn(),
     child: () => logger,
-  } satisfies Logger;
+  };
   return logger;
 }
 

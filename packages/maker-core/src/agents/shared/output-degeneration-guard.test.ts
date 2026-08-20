@@ -36,6 +36,18 @@ describe('OutputDegenerationGuard', () => {
     }
   });
 
+  it('checks every crossed interval when one text delta is large', () => {
+    const guard = new OutputDegenerationGuard();
+    guard.resetMessage();
+
+    expect(
+      guard.onTextDelta('let me write the file now; 现在执行；落地。'.repeat(1_100)),
+    ).toMatchObject({
+      kind: 'hard',
+      reason: 'low-entropy-repetition',
+    });
+  });
+
   it.each([
     [
       'long prose',

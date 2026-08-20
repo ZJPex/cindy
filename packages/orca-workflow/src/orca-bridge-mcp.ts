@@ -437,7 +437,9 @@ function captureSessionOutput(
     if (typeof result === 'string' && result.length > 0) {
       entry.finalText = result;
     }
-    if (isProductTurnDoneEvent(ev)) entry.status = 'done';
+    // Agent 为保留最终 result / usage，可能在 terminal error 后继续发 done。
+    // error 是更强的终态，不能被这条尾随 done 覆盖成成功。
+    if (isProductTurnDoneEvent(ev) && entry.status !== 'error') entry.status = 'done';
     return;
   }
   if (isTerminalAgentErrorEvent(ev) && !isTurnContinuationBoundaryEvent(ev)) {

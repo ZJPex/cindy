@@ -108,12 +108,26 @@ export class OutputDegenerationGuard {
 
     const normalized = this.normalizeDelta(delta);
     if (normalized.length === 0) return { kind: 'ok' };
-    this.chunks.push(normalized);
-    this.observedCharacters += normalized.length;
 
-    if (this.observedCharacters < this.nextCheckAt) return { kind: 'ok' };
-    this.nextCheckAt = this.observedCharacters + this.checkIntervalCharacters;
+    let offset = 0;
+    while (offset < normalized.length) {
+      const charactersUntilCheck = this.nextCheckAt - this.observedCharacters;
+      const nextOffset = Math.min(normalized.length, offset + charactersUntilCheck);
+      this.chunks.push(normalized.slice(offset, nextOffset));
+      this.observedCharacters += nextOffset - offset;
+      offset = nextOffset;
 
+      if (this.observedCharacters < this.nextCheckAt) continue;
+      this.nextCheckAt += this.checkIntervalCharacters;
+
+      const verdict = this.evaluateCheckpoint();
+      if (verdict.kind === 'hard') return verdict;
+    }
+
+    return { kind: 'ok' };
+  }
+
+  private evaluateCheckpoint(): OutputDegenerationVerdict {
     const window = this.compactWindow();
     if (window.length < this.analysisWindowCharacters) return { kind: 'ok' };
     const metrics = outputDegenerationMetrics(window, this.ngramSize);
