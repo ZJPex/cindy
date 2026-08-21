@@ -9,8 +9,8 @@
 
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 
-import * as expansionPreference from '../diffExpansionPreference';
 import * as registry from '../../../registry';
+import * as expansionPreference from '../diffExpansionPreference';
 import * as pluginMod from '../index';
 
 describe('review plugin', () => {
