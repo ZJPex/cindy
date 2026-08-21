@@ -3184,12 +3184,14 @@
           "copyLink": "Copy link",
           "copied": "Link copied",
           "state": {
-            "denied": "Authorization was cancelled on the Slack page",
+            "denied": "Slack authorization was cancelled; the account is not linked",
             "expired": "Authorization timed out, please reconnect",
             "failed": "Binding failed",
             "revoked": "Binding revoked"
           },
-          "retryHint": "Turn the switch back on to reconnect and link again."
+          "reauthorize": "Reauthorize Slack",
+          "reauthorizing": "Reauthorizing Slack…",
+          "retryHint": "Reauthorize Slack to reconnect and link the account."
         },
         "toast": {
           "saveFailed": "Failed to save",
@@ -3199,6 +3201,8 @@
         "loginRequired": "Sign in to your {{appName}} account first; the connection resumes automatically after login.",
         "standbyHint": "Another Cindy instance on this computer is using the Slack connection. Close it, then turn this switch back on to take over.",
         "authorizing": "Authorizing…",
+        "transportStatus": "Transport: {{status}}",
+        "accountStatus": "Slack Account: {{status}}",
         "statusBound": "Linked as @{{name}}",
         "statusBoundTeam": "Linked to {{team}} as @{{name}}",
         "statusUnbound": "Not linked",
@@ -6982,6 +6986,8 @@
       "rateLimitRetrying": "Request rate limited — retrying automatically ({{attempt}}/{{maxAttempts}})…",
       "overloadBusy": "The model service is busy — the upstream has no capacity right now. Click \"Retry\", or switch to another model.",
       "overloadBusyNoRetry": "The model service is busy — the upstream has no capacity right now. Try again later, or switch to another model.",
+      "streamInterrupted": "The model stream was interrupted. This is usually a temporary upstream issue — click Retry.",
+      "streamInterruptedNoRetry": "The model stream was interrupted. This is usually a temporary upstream issue. Try again in a little while.",
       "networkShowRaw": "Show raw error",
       "networkHideRaw": "Hide raw error",
       "silentStopContinue": "Continue",
