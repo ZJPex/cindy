@@ -11,6 +11,7 @@ import {
   codexDisabledSkillPathsForOwner,
   codexGlobalSkillsPaths,
   prepareCodexGlobalSkillsLinks,
+  readCodexAgentsProjectionIdentity,
 } from '../maker-host/codex-global-skills';
 
 let tmpDirs: string[] = [];
@@ -646,6 +647,9 @@ describe('prepareCodexGlobalSkillsLinks', () => {
       ownerRoot,
       approvedGhostSkills: approvedGhostSkills([approved.ghost]),
     });
+    await expect(readCodexAgentsProjectionIdentity(codexHome, homeDir)).resolves.toBe(
+      initial.agentsProjectionIdentity,
+    );
     const projectionDir = await fs.realpath(paths.sharedAgentsSkillsLink);
 
     await fs.rm(path.join(projectionDir, 'ghost-a--profile-a'), {
@@ -665,6 +669,9 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     expect(repaired.warnings).toEqual([]);
     expect(repaired.changed).toBe(true);
     expect(repaired.agentsProjectionIdentity).not.toBe(initial.agentsProjectionIdentity);
+    await expect(readCodexAgentsProjectionIdentity(codexHome, homeDir)).resolves.toBe(
+      repaired.agentsProjectionIdentity,
+    );
     expect(await fs.realpath(paths.sharedAgentsSkillsLink)).toBe(projectionDir);
     expect(
       await sameRealPath(path.join(projectionDir, 'ghost-a--profile-a'), approvedSkill),

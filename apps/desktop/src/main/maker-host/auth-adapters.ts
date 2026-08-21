@@ -33,6 +33,7 @@ import { getCachedBinaryStatus, isVettedAgentBinaryPath } from '../agent-binarie
 import { createLogger } from '../logger.js';
 import {
   prepareCodexGlobalSkillsLinks,
+  readCodexAgentsProjectionIdentity,
   type CodexApprovedGhostSkillSource,
 } from './codex-global-skills.js';
 import { prepareCodexGlobalRulesCopy } from './codex-global-rules.js';
@@ -90,6 +91,7 @@ import {
 } from '../appSessionState.js';
 import {
   assertGhostSkillProjectionBoundaryStableForOwner,
+  withSharedGlobalSkillProjectionAccess,
   withSharedGlobalSkillProjectionMutation,
 } from '../authBoundaryQuarantine.js';
 import {
@@ -1211,11 +1213,16 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
     // links must populate that directory before prepareCodexGlobalSkillsLinks runs.
     const assertOwnerStable = () => assertCodexAssetPrepOwnerStable(owner);
     assertOwnerStable();
-    const sharedOutcome = await withSharedGlobalSkillProjectionMutation(owner.ownerId, () =>
-      prepareSharedGlobalSkillLinks({
-        assertOwnerStable,
-      }),
-    ).then(
+    const sharedOutcome = await withSharedGlobalSkillProjectionAccess(owner.ownerId, {
+      mutate: async () => {
+        const result = await prepareSharedGlobalSkillLinks({
+          assertOwnerStable,
+        });
+        return { warnings: result.warnings };
+      },
+      // 共库 passive 只消费 primary 已发布的共享根，不得自行对账或落盘。
+      observe: async () => ({ warnings: [] }),
+    }).then(
       (r) => ({ ok: true as const, label: 'shared-skills' as const, warnings: r.warnings }),
       (err: Error) => ({ ok: false as const, label: 'shared-skills' as const, err }),
     );
@@ -1227,13 +1234,25 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
     // Codex Skill 准备会发布 xdt-agents 并删除旧的内容寻址投影；两步必须共用
     // 跨进程锁，避免共享 userData 的 dev / packaged 实例互删对方刚发布的目录。
     const [skillsOutcome, rulesOutcome, pluginsOutcome] = await Promise.all([
-      withSharedGlobalSkillProjectionMutation(owner.ownerId, () =>
-        prepareCodexGlobalSkillsLinks(this.codexHome, {
-          ownerRoot: owner.ownerRoot,
-          ...(approvedGhostSkills ? { approvedGhostSkills } : {}),
-          assertOwnerStable,
+      withSharedGlobalSkillProjectionAccess(owner.ownerId, {
+        mutate: async () => {
+          const result = await prepareCodexGlobalSkillsLinks(this.codexHome, {
+            ownerRoot: owner.ownerRoot,
+            ...(approvedGhostSkills ? { approvedGhostSkills } : {}),
+            assertOwnerStable,
+          });
+          return {
+            warnings: result.warnings,
+            changed: result.changed,
+            agentsProjectionIdentity: result.agentsProjectionIdentity,
+          };
+        },
+        observe: async () => ({
+          warnings: [],
+          changed: false,
+          agentsProjectionIdentity: await readCodexAgentsProjectionIdentity(this.codexHome),
         }),
-      ).then(
+      }).then(
         (r) => ({
           ok: true as const,
           label: 'skills' as const,

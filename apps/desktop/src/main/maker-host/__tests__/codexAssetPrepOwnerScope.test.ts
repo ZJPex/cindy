@@ -9,6 +9,8 @@ const harness = vi.hoisted(() => ({
   homeDir: '/home/test-user',
   sharedMutationOwners: [] as Array<string | null>,
   sharedMutationDepth: 0,
+  rejectSharedMutations: false,
+  readOnlyOwners: [] as string[],
   sharedPrepDepths: [] as number[],
   codexPrepDepths: [] as number[],
   codexProjectionIdentity: 'agents-a:1:1:1:1' as string | null,
@@ -50,9 +52,36 @@ vi.mock('../../appSessionState.js', () => ({
 
 vi.mock('../../authBoundaryQuarantine.js', () => ({
   assertGhostSkillProjectionBoundaryStableForOwner: vi.fn(),
+  withGhostSkillProjectionReadOnlyOwner: vi.fn(
+    async <T>(ownerId: string, observation: () => Promise<T>): Promise<T> => {
+      harness.readOnlyOwners.push(ownerId);
+      return observation();
+    },
+  ),
+  withSharedGlobalSkillProjectionAccess: vi.fn(
+    async <T>(
+      ownerId: string | null,
+      access: { mutate: () => Promise<T>; observe: () => Promise<T> },
+    ): Promise<T> => {
+      harness.sharedMutationOwners.push(ownerId);
+      if (harness.rejectSharedMutations) {
+        harness.readOnlyOwners.push(ownerId!);
+        return access.observe();
+      }
+      harness.sharedMutationDepth += 1;
+      try {
+        return await access.mutate();
+      } finally {
+        harness.sharedMutationDepth -= 1;
+      }
+    },
+  ),
   withSharedGlobalSkillProjectionMutation: vi.fn(
     async <T>(ownerId: string | null, mutation: () => Promise<T>): Promise<T> => {
       harness.sharedMutationOwners.push(ownerId);
+      if (harness.rejectSharedMutations) {
+        throw new Error('Passive shared-userData instances cannot mutate global skill projections');
+      }
       harness.sharedMutationDepth += 1;
       try {
         return await mutation();
@@ -71,6 +100,7 @@ vi.mock('../shared-global-skills.js', () => ({
 }));
 
 vi.mock('../codex-global-skills.js', () => ({
+  readCodexAgentsProjectionIdentity: vi.fn(async () => harness.codexProjectionIdentity),
   prepareCodexGlobalSkillsLinks: vi.fn(async () => {
     harness.codexPrepDepths.push(harness.sharedMutationDepth);
     return {
@@ -100,6 +130,8 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
     harness.ownerRoot = '/data/owners/owner-a';
     harness.sharedMutationOwners = [];
     harness.sharedMutationDepth = 0;
+    harness.rejectSharedMutations = false;
+    harness.readOnlyOwners = [];
     harness.sharedPrepDepths = [];
     harness.codexPrepDepths = [];
     harness.codexProjectionIdentity = 'agents-a:1:1:1:1';
@@ -309,6 +341,49 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
       { skillsProjectionEpoch: 2 },
       { skillsProjectionEpoch: 2 },
     ]);
+  });
+
+  it('lets a passive process observe a primary projection publication without mutating it', async () => {
+    const { DesktopCodexAuthAdapter } = await import('../auth-adapters.js');
+    const adapter = Object.create(DesktopCodexAuthAdapter.prototype) as {
+      skillsProjectionEpoch: number;
+      observedAgentsProjectionIdentity: string | null | undefined;
+    };
+    Object.defineProperties(adapter, {
+      skillsProjectionEpoch: { configurable: true, writable: true, value: 0 },
+      observedAgentsProjectionIdentity: {
+        configurable: true,
+        writable: true,
+        value: undefined,
+      },
+    });
+    const runEnsureGlobalCodexAssets = (
+      DesktopCodexAuthAdapter.prototype as unknown as {
+        runEnsureGlobalCodexAssets(owner: {
+          ownerId: string;
+          ownerRoot: string;
+          ownerScopeKey: string;
+        }): Promise<{ skillsProjectionEpoch: number }>;
+      }
+    ).runEnsureGlobalCodexAssets;
+    const owner = {
+      ownerId: 'owner-a',
+      ownerRoot: '/data/owners/owner-a',
+      ownerScopeKey: 'cloud:owner-a:1',
+    };
+    harness.rejectSharedMutations = true;
+
+    await expect(runEnsureGlobalCodexAssets.call(adapter, owner)).resolves.toEqual({
+      skillsProjectionEpoch: 0,
+    });
+
+    harness.codexProjectionIdentity = 'agents-a:1:2:2:2';
+    await expect(runEnsureGlobalCodexAssets.call(adapter, owner)).resolves.toEqual({
+      skillsProjectionEpoch: 1,
+    });
+
+    expect(harness.readOnlyOwners).toEqual(['owner-a', 'owner-a', 'owner-a', 'owner-a']);
+    expect(harness.codexPrepDepths).toEqual([]);
   });
 
   it('rejects a queued owner capture after a later Profile becomes active', async () => {

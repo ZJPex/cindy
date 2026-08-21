@@ -574,6 +574,34 @@ export function codexGlobalSkillsPaths(codexHome: string, homeDir = os.homedir()
   };
 }
 
+/**
+ * 只读观察 primary 已发布的 owner-filtered agents 投影身份。
+ * 调用方必须持有对应 owner 的只读边界锁，确保链接目标与目录身份来自同一发布快照。
+ */
+export async function readCodexAgentsProjectionIdentity(
+  codexHome: string,
+  homeDir = os.homedir(),
+): Promise<string | null | undefined> {
+  const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+  if (!(await isDirectory(paths.sharedAgentsSkillsDir))) return null;
+
+  const linkStat = await fsp.lstat(paths.sharedAgentsSkillsLink).catch(() => null);
+  if (!linkStat?.isSymbolicLink()) return undefined;
+
+  const projectionDir = await realPathOrNull(paths.sharedAgentsSkillsLink);
+  const projectionRoot = await realPathOrNull(path.join(paths.codexHome, 'skill-projections'));
+  if (
+    !projectionDir ||
+    !projectionRoot ||
+    path.dirname(projectionDir) !== projectionRoot ||
+    !/^agents-[a-f0-9]{20}$/.test(path.basename(projectionDir))
+  ) {
+    return undefined;
+  }
+
+  return agentsProjectionPublicationIdentity(projectionDir);
+}
+
 export async function prepareCodexGlobalSkillsLinks(
   codexHome: string,
   opts: PrepareOptions = {},
