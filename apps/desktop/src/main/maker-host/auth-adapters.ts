@@ -806,7 +806,7 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
    * 代次 sticky 保证每个 cwd 在首次使用新投影时仍会 forceReload。
    */
   private skillsProjectionEpoch = 0;
-  /** 上次由本进程确认的内容寻址投影，用于感知其他进程已经完成的发布。 */
+  /** 上次由本进程确认的投影发布身份，用于感知其他进程完成的切换或同签名修复。 */
   private observedAgentsProjectionIdentity: string | null | undefined;
   private skillsListReloadedEpochByCwd = new Map<string, number>();
 

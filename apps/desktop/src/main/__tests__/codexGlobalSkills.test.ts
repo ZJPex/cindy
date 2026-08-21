@@ -641,7 +641,7 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     await writeSkill(path.dirname(wrongTarget), path.basename(wrongTarget));
 
     const paths = codexGlobalSkillsPaths(codexHome, homeDir);
-    await prepareCodexGlobalSkillsLinks(codexHome, {
+    const initial = await prepareCodexGlobalSkillsLinks(codexHome, {
       homeDir,
       ownerRoot,
       approvedGhostSkills: approvedGhostSkills([approved.ghost]),
@@ -664,6 +664,7 @@ describe('prepareCodexGlobalSkillsLinks', () => {
 
     expect(repaired.warnings).toEqual([]);
     expect(repaired.changed).toBe(true);
+    expect(repaired.agentsProjectionIdentity).not.toBe(initial.agentsProjectionIdentity);
     expect(await fs.realpath(paths.sharedAgentsSkillsLink)).toBe(projectionDir);
     expect(
       await sameRealPath(path.join(projectionDir, 'ghost-a--profile-a'), approvedSkill),

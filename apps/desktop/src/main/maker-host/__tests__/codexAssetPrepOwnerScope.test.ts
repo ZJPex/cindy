@@ -11,7 +11,7 @@ const harness = vi.hoisted(() => ({
   sharedMutationDepth: 0,
   sharedPrepDepths: [] as number[],
   codexPrepDepths: [] as number[],
-  codexProjectionIdentity: 'agents-a' as string | null,
+  codexProjectionIdentity: 'agents-a:1:1:1:1' as string | null,
 }));
 
 vi.mock('electron', () => ({
@@ -102,10 +102,10 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
     harness.sharedMutationDepth = 0;
     harness.sharedPrepDepths = [];
     harness.codexPrepDepths = [];
-    harness.codexProjectionIdentity = 'agents-a';
+    harness.codexProjectionIdentity = 'agents-a:1:1:1:1';
   });
 
-  it('advances the local epoch when another process publishes a new projection identity', async () => {
+  it('advances the local epoch when another process repairs the same-signature projection', async () => {
     const { DesktopCodexAuthAdapter } = await import('../auth-adapters.js');
     const adapter = Object.create(DesktopCodexAuthAdapter.prototype) as {
       skillsProjectionEpoch: number;
@@ -138,7 +138,7 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
       skillsProjectionEpoch: 0,
     });
 
-    harness.codexProjectionIdentity = 'agents-b';
+    harness.codexProjectionIdentity = 'agents-a:1:2:2:2';
     await expect(runEnsureGlobalCodexAssets.call(adapter, owner)).resolves.toEqual({
       skillsProjectionEpoch: 1,
     });

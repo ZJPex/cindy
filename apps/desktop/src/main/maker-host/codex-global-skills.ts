@@ -37,8 +37,9 @@ export interface CodexGlobalSkillsPrepareResult {
   skillsDir: string;
   changed: boolean;
   /**
-   * 当前实际发布的 agents 内容寻址投影；undefined 表示本轮无法安全确认，null 表示来源缺失。
-   * 每个进程据此感知由其他进程完成、因而本轮没有本地写盘的投影切换。
+   * 当前实际发布的 agents 投影身份（内容签名 + 目录发布版本）；undefined 表示本轮无法
+   * 安全确认，null 表示来源缺失。每个进程据此感知由其他进程完成、因而本轮没有本地
+   * 写盘的投影切换或同签名修复。
    */
   agentsProjectionIdentity: string | null | undefined;
   sources: CodexGlobalSkillSourceResult[];
@@ -403,6 +404,23 @@ function hasFsIdentity(value: Pick<import('node:fs').BigIntStats, 'dev' | 'ino'>
   return value.dev !== 0n && value.ino !== 0n;
 }
 
+async function agentsProjectionPublicationIdentity(
+  projectionDir: string,
+): Promise<string | undefined> {
+  const stat = await fsp.lstat(projectionDir, { bigint: true }).catch(() => null);
+  if (!stat?.isDirectory() || stat.isSymbolicLink()) return undefined;
+
+  // 内容签名相同时，损坏修复仍会把新的 staging 目录发布到同一路径。目录的文件身份与
+  // 稳定时间戳构成跨进程可观察的发布版本；dev/ino 不可用的文件系统仍可依靠时间戳。
+  return [
+    path.basename(projectionDir),
+    stat.dev,
+    stat.ino,
+    stat.mtimeNs,
+    stat.ctimeNs,
+  ].join(':');
+}
+
 async function removeQuarantinedProjection(
   quarantineDir: string,
   expected: Pick<import('node:fs').BigIntStats, 'dev' | 'ino'>,
@@ -618,7 +636,7 @@ export async function prepareCodexGlobalSkillsLinks(
       );
     }
     if (sourceDef.name === 'agents' && (result.status === 'linked' || result.status === 'kept')) {
-      agentsProjectionIdentity = path.basename(linkTarget);
+      agentsProjectionIdentity = await agentsProjectionPublicationIdentity(linkTarget);
       await cleanupStaleAgentsProjections(
         paths.codexHome,
         linkTarget,
