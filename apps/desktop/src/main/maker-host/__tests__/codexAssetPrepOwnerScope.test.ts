@@ -13,7 +13,7 @@ const harness = vi.hoisted(() => ({
   readOnlyOwners: [] as string[],
   sharedPrepDepths: [] as number[],
   codexPrepDepths: [] as number[],
-  codexProjectionIdentity: 'agents-a:1:1:1:1' as string | null,
+  codexProjectionIdentity: 'agents-a:1:1:1:1' as string | null | undefined,
 }));
 
 vi.mock('electron', () => ({
@@ -384,6 +384,52 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
     });
 
     expect(harness.readOnlyOwners).toEqual(['owner-a', 'owner-a', 'owner-a', 'owner-a']);
+    expect(harness.codexPrepDepths).toEqual([]);
+  });
+
+  it('advances the local epoch when an unknown passive projection observation recovers', async () => {
+    const { DesktopCodexAuthAdapter } = await import('../auth-adapters.js');
+    const adapter = Object.create(DesktopCodexAuthAdapter.prototype) as {
+      skillsProjectionEpoch: number;
+      observedAgentsProjectionIdentity: string | null | undefined;
+    };
+    Object.defineProperties(adapter, {
+      skillsProjectionEpoch: { configurable: true, writable: true, value: 0 },
+      observedAgentsProjectionIdentity: {
+        configurable: true,
+        writable: true,
+        value: undefined,
+      },
+    });
+    const runEnsureGlobalCodexAssets = (
+      DesktopCodexAuthAdapter.prototype as unknown as {
+        runEnsureGlobalCodexAssets(owner: {
+          ownerId: string;
+          ownerRoot: string;
+          ownerScopeKey: string;
+        }): Promise<{ skillsProjectionEpoch: number }>;
+      }
+    ).runEnsureGlobalCodexAssets;
+    const owner = {
+      ownerId: 'owner-a',
+      ownerRoot: '/data/owners/owner-a',
+      ownerScopeKey: 'cloud:owner-a:1',
+    };
+    harness.rejectSharedMutations = true;
+    harness.codexProjectionIdentity = undefined;
+
+    await expect(runEnsureGlobalCodexAssets.call(adapter, owner)).resolves.toEqual({
+      skillsProjectionEpoch: 0,
+    });
+
+    harness.codexProjectionIdentity = 'agents-a:1:2:2:2';
+    await expect(runEnsureGlobalCodexAssets.call(adapter, owner)).resolves.toEqual({
+      skillsProjectionEpoch: 1,
+    });
+    await expect(runEnsureGlobalCodexAssets.call(adapter, owner)).resolves.toEqual({
+      skillsProjectionEpoch: 1,
+    });
+
     expect(harness.codexPrepDepths).toEqual([]);
   });
 

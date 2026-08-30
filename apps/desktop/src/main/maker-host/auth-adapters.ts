@@ -840,6 +840,8 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
   private skillsProjectionEpoch = 0;
   /** 上次由本进程确认的投影发布身份，用于感知其他进程完成的切换或同签名修复。 */
   private observedAgentsProjectionIdentity: string | null | undefined;
+  /** 区分“尚未观察”与“已观察到不可确认状态”，让未知投影恢复后也能刷新旧缓存。 */
+  private hasObservedAgentsProjectionState = false;
   private skillsListReloadedEpochByCwd = new Map<string, number>();
 
   /**
@@ -1334,16 +1336,17 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
       );
     }
     if (skillsOutcome.ok) {
+      const hadPreviousObservation = this.hasObservedAgentsProjectionState;
       const previousIdentity = this.observedAgentsProjectionIdentity;
       const nextIdentity = skillsOutcome.agentsProjectionIdentity;
-      if (nextIdentity !== undefined) {
-        this.observedAgentsProjectionIdentity = nextIdentity;
-      }
+      this.hasObservedAgentsProjectionState = true;
+      this.observedAgentsProjectionIdentity = nextIdentity;
       // 首次观察没有旧 app-server 缓存，无需额外推进代次。此后即使本轮没有写盘，
-      // 只要观察到另一进程发布了新投影，也必须让每个 cwd 在首次使用时 forceReload。
+      // 只要观察到另一进程发布了新投影，或不可确认状态恢复为有效身份，也必须让每个
+      // cwd 在首次使用时 forceReload。
       if (
         skillsOutcome.changed ||
-        (previousIdentity !== undefined &&
+        (hadPreviousObservation &&
           nextIdentity !== undefined &&
           previousIdentity !== nextIdentity)
       ) {
