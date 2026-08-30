@@ -42,6 +42,18 @@ describe('classifyPiToolForAutoReview', () => {
       toolName: 'write', input: { path: '/Users/t/reference/spec.md' }, workspaceRoots: roots, readRoots,
     })).toBe('prompt');
   });
+  it('allows structured writes only in explicitly writable extra roots', () => {
+    const readRoots = [WS, '/Users/t/reference', '/Users/t/output'];
+    const writableRoots = [WS, '/Users/t/output'];
+    expect(classifyPiToolForAutoReview({
+      toolName: 'write', input: { path: '/Users/t/output/result.md' },
+      workspaceRoots: roots, readRoots, writableRoots,
+    })).toBe('auto-approve');
+    expect(classifyPiToolForAutoReview({
+      toolName: 'write', input: { path: '/Users/t/reference/spec.md' },
+      workspaceRoots: roots, readRoots, writableRoots,
+    })).toBe('prompt');
+  });
 
   it('routes bash through the shell classifier', () => {
     expect(verdict('bash', { command: 'ls -la' })).toBe('auto-approve');
@@ -144,6 +156,14 @@ describe('classifyPiToolForAutoReview', () => {
 
   it('fails closed for MCP and unknown tools', () => {
     expect(verdict('mcp__cindy_orca__start_team', { anything: 1 })).toBe('prompt');
+    expect(verdict('some_future_tool', {})).toBe('prompt');
+  });
+
+  it('auto-approves first-party durable Subagent spawn without opening unknown tools', () => {
+    expect(verdict('subagent', {
+      agent: 'worker',
+      task: 'implement the fix',
+    })).toBe('auto-approve');
     expect(verdict('some_future_tool', {})).toBe('prompt');
   });
 });

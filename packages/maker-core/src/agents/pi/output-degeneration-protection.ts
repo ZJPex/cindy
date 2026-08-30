@@ -11,6 +11,8 @@ export const PI_ALLOW_REPETITIVE_OUTPUT_DIRECTIVE = '/allow-repetitive-output';
 interface PiAbortResponse {
   success: boolean;
   error?: unknown;
+  /** 检测所属 turn 已结束或切换时，不再发送/消费 session-global abort。 */
+  ignored?: boolean;
 }
 
 export interface PiOutputDegenerationProtectionOptions {
@@ -120,6 +122,13 @@ export class PiOutputDegenerationProtection {
     });
     void this.abort().then(
       (response) => {
+        if (response.ignored) {
+          this.logger.info('pi output degeneration abort ignored after turn advanced', {
+            reason: verdict.reason,
+            observedCharacters: verdict.observedCharacters,
+          });
+          return;
+        }
         if (response.success) {
           this.logger.info('pi output degeneration abort accepted', {
             reason: verdict.reason,

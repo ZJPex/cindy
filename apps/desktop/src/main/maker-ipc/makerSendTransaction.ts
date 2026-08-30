@@ -5,9 +5,7 @@ import {
   type SessionSendResult,
   type UserMessage,
 } from '@cindy/maker-core';
-import {
-  CODEX_RESUME_NOT_READY_WIRE_MESSAGE,
-} from '@cindy/maker-shared/agent-input-projection';
+import { CODEX_RESUME_NOT_READY_WIRE_MESSAGE } from '@cindy/maker-shared/agent-input-projection';
 
 import {
   createHostSendFailure,
@@ -27,9 +25,54 @@ import {
   buildMobileClientPromptNote,
   shouldPrependMobileClientPromptNote,
 } from './mobileClientPromptNote.js';
+import { excludeDirectoryGrantConflicts, validateExtraDirs } from './extraDirsValidator.js';
 import type { MakerSessionCreateOpts } from './sessionRequest.js';
 
 type CreateOpts = MakerSessionCreateOpts;
+
+export interface BootstrapDirectoryGrantDeps {
+  readPersistedWritableDirs(sessionId: string): Promise<string[]>;
+  persistExistingSession(
+    sessionId: string,
+    patch: { extraDirs: string[]; writableDirs: string[] },
+  ): Promise<void>;
+}
+
+function sameDirectoryList(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+/**
+ * Apply the exact directory-grant subset that a session may start with. Existing local
+ * session rows are narrowed before the runtime is created, so a failed persist cannot
+ * leave a stale grant waiting to be reactivated on the next lazy bootstrap.
+ */
+export async function prepareDirectoryGrantsForBootstrap(
+  opts: CreateOpts,
+  deps: BootstrapDirectoryGrantDeps,
+): Promise<void> {
+  const requestedExtraDirs = opts.extraDirs ?? [];
+  // Writable roots are a Main-owned persisted grant. CREATE_SESSION and lazy SEND payloads are
+  // renderer/device-link controlled, so bootstrap must replace them with SQLite truth.
+  const requestedWritableDirs =
+    typeof opts.id === 'string' && opts.id
+      ? await deps.readPersistedWritableDirs(opts.id)
+      : [];
+  const extraValidation = await validateExtraDirs(requestedExtraDirs, opts.workingDir);
+  const writableValidation = await validateExtraDirs(requestedWritableDirs, opts.workingDir);
+  const extraDirs = extraValidation.valid;
+  const writableDirs = await excludeDirectoryGrantConflicts(writableValidation.valid, extraDirs);
+
+  if (opts.extraDirs !== undefined || extraDirs.length > 0) opts.extraDirs = extraDirs;
+  if (opts.writableDirs !== undefined || writableDirs.length > 0) opts.writableDirs = writableDirs;
+
+  const changed =
+    !sameDirectoryList(requestedExtraDirs, extraDirs) ||
+    !sameDirectoryList(requestedWritableDirs, writableDirs);
+  if (!changed || opts.remoteHostId || typeof opts.id !== 'string' || !opts.id) return;
+
+  await deps.persistExistingSession(opts.id, { extraDirs, writableDirs });
+}
 
 type IpcUserMessage =
   string | { type: 'user'; content: string | Array<{ type: string; [k: string]: unknown }> };
@@ -48,6 +91,8 @@ type MakerSendOptions = {
    */
   ackInterruptedTurnOnDispatch?: boolean;
   signal?: AbortSignal;
+  /** Coordinator leftover reclaim: capture vendor generation at Session reservation. */
+  onVendorTurnReserved?: (generation: number) => void;
   /**
    * scheduler 排队消息的来源标记(coordinator drain 透传,见 AgentInputSendOpts.origin)。
    * 打到 sess.send 的 origin(本轮 turnOrigin)并合进落库 user 消息 agentMeta.origin。
@@ -64,6 +109,7 @@ type MakerSendOptions = {
   persistUserMessage?: {
     clientId?: unknown;
     content?: unknown;
+    agentFacingWireContent?: unknown;
     sdkSessionId?: unknown;
     delivery?: unknown;
     shouldBroadcast?: unknown;
@@ -134,6 +180,7 @@ export interface MakerSendTransactionDeps {
   buildCreateOptsWithStderr(opts: CreateOpts): CreateOpts;
   synthesizeOrcaVendorOptionsFromDb(sessionId: string, opts: CreateOpts): Promise<boolean>;
   readSessionExtraDirsFromDb(sessionId: string): Promise<string[]>;
+  readSessionWritableDirsFromDb?(sessionId: string): Promise<string[]>;
   withRehydrateCloseSuppressed<T>(sessionId: string, fn: () => Promise<T>): Promise<T>;
   bootstrapSession(opts: CreateOpts): Promise<{
     session: MakerSendTransactionSession;
@@ -215,6 +262,11 @@ export interface MakerSendTransactionDeps {
    */
   applyPendingAgentSwitch?(sessionId: string): Promise<void>;
   /**
+   * 发送前换窗:必须在 getSession 之前。prepare 会关掉不健康的 live handle,
+   * 随后本事务按空 session 走 lazy-create,避免 peek 之后对已关闭对象 send。
+   */
+  prepareUnhealthySession?(sessionId: string): Promise<boolean | void>;
+  /**
    * session-agent-switch:pending 交接读取(agentHandoff 注册表)。命中时把交接
    * 文本前置进 wire payload(不影响 persistUserMessage 落库显示内容),并在
    * dispatch 跨过不可逆边界(accepted)后 consume;未 accepted / 抛错保留 pending。
@@ -261,6 +313,7 @@ type ResolveSessionResult =
 function readPersistUserMessageOption(sendOpts: MakerSendOptions): {
   clientId: string;
   content: unknown;
+  agentFacingWireContent?: IpcUserMessage;
   sdkSessionId?: string;
   delivery?: 'turn' | 'steer';
   autoResume?: boolean;
@@ -279,6 +332,9 @@ function readPersistUserMessageOption(sendOpts: MakerSendOptions): {
   return {
     clientId: persist.clientId,
     content: persist.content,
+    ...(persist.agentFacingWireContent && typeof persist.agentFacingWireContent === 'object'
+      ? { agentFacingWireContent: persist.agentFacingWireContent as IpcUserMessage }
+      : {}),
     ...(typeof persist.sdkSessionId === 'string' ? { sdkSessionId: persist.sdkSessionId } : {}),
     ...(persist.autoResume === true ? { autoResume: true as const } : {}),
     ...(persist.autoResumeInfo && typeof persist.autoResumeInfo === 'object'
@@ -376,15 +432,27 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
     opts: CreateOpts,
     source: 'lazy-create' | 'active-orca-rehydrate',
   ): Promise<void> {
-    if (opts.extraDirs !== undefined) return;
-    try {
-      const row = await deps.readSessionExtraDirsFromDb(sessionId);
-      if (row.length > 0) opts.extraDirs = row;
-    } catch (err) {
-      deps.log.warn(`${source}: read extra_dirs from DB failed (non-fatal)`, {
-        sessionId,
-        err: err instanceof Error ? err.message : String(err),
-      });
+    if (opts.extraDirs === undefined) {
+      try {
+        const row = await deps.readSessionExtraDirsFromDb(sessionId);
+        if (row.length > 0) opts.extraDirs = row;
+      } catch (err) {
+        deps.log.warn(`${source}: read extra_dirs from DB failed (non-fatal)`, {
+          sessionId,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    if (opts.writableDirs === undefined) {
+      try {
+        const row = (await deps.readSessionWritableDirsFromDb?.(sessionId)) ?? [];
+        if (row.length > 0) opts.writableDirs = row;
+      } catch (err) {
+        deps.log.warn(`${source}: read writable_dirs from DB failed (non-fatal)`, {
+          sessionId,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
 
@@ -596,6 +664,7 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
       // 去时才切」)。必须在 getSession 之前——apply 会 close 旧引擎的 live session,
       // 让下方走 lazy-create 按 DB 新值 spawn 新引擎。
       await deps.applyPendingAgentSwitch?.(sessionId);
+      await deps.prepareUnhealthySession?.(sessionId);
       let sess = deps.getSession(sessionId);
       // Maker keeps a failed Session registered until its real handle cleanup
       // succeeds. It is not a reusable send target: route it through the
@@ -803,9 +872,7 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
       })();
       const startsWithSlashCommand =
         reconcileSlashRanges !== undefined
-          ? reconcileSlashRanges.some(
-              (range) => (range as { start?: unknown } | null)?.start === 0,
-            )
+          ? reconcileSlashRanges.some((range) => (range as { start?: unknown } | null)?.start === 0)
           : reconcilePersistText.startsWith('/');
       const isOrdinaryUserTurn =
         soForReconcile.origin === undefined &&
@@ -829,8 +896,8 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
       // 两个来源:直连 maker:send 走 async context(deps 注入);排队 / 插入路径走
       // coordinator 从队列项透传的 so.fromMobileClient(drain 时 context 已结束)。
       const mobileClientNote =
-        (deps.isMobileClientInvoke?.() === true || so.fromMobileClient === true)
-        && shouldPrependMobileClientPromptNote(normalized, sess.agentKind)
+        (deps.isMobileClientInvoke?.() === true || so.fromMobileClient === true) &&
+        shouldPrependMobileClientPromptNote(normalized, sess.agentKind)
           ? buildMobileClientPromptNote()
           : null;
       const outgoing = mobileClientNote
@@ -936,6 +1003,7 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
           throwOnStartFailure: so.throwOnStartFailure,
           turnAttemptToken: so.turnAttemptToken,
           signal: so.signal,
+          ...(so.onVendorTurnReserved ? { onTurnReserved: so.onVendorTurnReserved } : {}),
           // scheduler 排队消息:origin 打到本轮 turnOrigin(IM 转播识别自动 turn),
           // 与 runner 直发路径的 session.send({ origin }) 语义对齐。
           ...(so.origin ? { origin: so.origin } : {}),
@@ -1008,10 +1076,14 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
                         ...(persistUserMessage.recoveryCheckpoint
                           ? { recoveryCheckpoint: persistUserMessage.recoveryCheckpoint }
                           : {}),
-                        ...(persistUserMessage.origin ? { origin: persistUserMessage.origin } : {}),
-                        // scheduler 排队消息:与 runner 直发路径落库的 agentMeta.origin
-                        // 对齐,renderer 据此渲染"由自动化任务发送"标签。
-                        ...(so.origin ? { origin: so.origin } : {}),
+                        ...(persistUserMessage.agentFacingWireContent
+                          ? { agentFacingWireContent: persistUserMessage.agentFacingWireContent }
+                          : {}),
+                        // 队列来源写入 agentMeta,不发给 maker-core。Orca 只在 persist
+                        // 上;scheduler 直发可能只在 sendOpts.origin 上。
+                        ...((persistUserMessage.origin ?? so.origin)
+                          ? { origin: persistUserMessage.origin ?? so.origin }
+                          : {}),
                       },
                     },
                     persistUserMessage.shouldBroadcast ||

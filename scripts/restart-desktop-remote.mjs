@@ -13,9 +13,12 @@ import {
 import {
   buildDesktopDevVerdictFromFailure,
   buildDesktopDevVerdictFromWhoami,
+  desktopRestartArgvConflictMessage,
+  normalizeDesktopRestartArgv,
   printDesktopDevVerdict,
   resolveIsolatedArg,
   restartContextFromArgv,
+  SHARED_USERDATA_ARG,
 } from './desktop-dev-verdict.mjs';
 import { collectDesktopWhoamiReport } from './desktop-whoami.mjs';
 
@@ -378,6 +381,16 @@ export function isRepositoryDesktopDevProcess(proc, checkoutPaths, currentPid = 
   if (!proc.pid || proc.pid === currentPid) return false;
   const command = normalize(proc.command);
   if (command.includes('apps/claude-code-bin') || command.includes('apps/codex-bin')) return false;
+  // Durable PI Subagent runners intentionally outlive the Electron main
+  // process. They use the bundled Electron executable with
+  // ELECTRON_RUN_AS_NODE=1, so the executable path alone looks like a Desktop
+  // dev process. Killing them alongside the app turns a normal dev restart
+  // into an unexpected terminal failure instead of letting the next Desktop
+  // instance reattach to the still-running durable job.
+  if (
+    command.includes('/runtime/pi-subagent-runs/')
+    && command.includes('/runner.cjs')
+  ) return false;
 
   return hasRepositoryCheckoutPath(command, checkoutPaths) && hasDesktopDevSignature(command);
 }
@@ -782,6 +795,10 @@ export function devEnvPrefix(env = process.env, platform = process.platform) {
     ['XDT_ISOLATED_AUTH', env.XDT_ISOLATED_AUTH],
     // CDP 端口覆写(bootstrap-electron 消费): 并行多开沙箱时给后起实例换端口。
     ['XDT_CDP_PORT', env.XDT_CDP_PORT],
+    // 一次性 Grok wire 归因探针(dev-only;正常环境不设置,不产生额外日志)。
+    ['XDT_WIRE_DIAGNOSTICS', env.XDT_WIRE_DIAGNOSTICS],
+    // 一次性 Grok strict tool spike(dev-only;必须与 wire probe 一起显式开启)。
+    ['XDT_WIRE_DIAGNOSTICS_STRICT', env.XDT_WIRE_DIAGNOSTICS_STRICT],
     ['CINDY_IOS_SIMULATOR_NATIVE_H264', env.CINDY_IOS_SIMULATOR_NATIVE_H264],
     ['CINDY_IOS_SIMULATOR_NATIVE_HID', env.CINDY_IOS_SIMULATOR_NATIVE_HID],
     ['XDT_TAPDB_DEV', env.XDT_TAPDB_DEV],
@@ -969,7 +986,9 @@ export function applyDesktopStartupConfigForPhase(options) {
 }
 
 async function main() {
-  let argv = process.argv.slice(2);
+  let argv = normalizeDesktopRestartArgv(process.argv.slice(2), process.env);
+  const sharedArgvConflict = desktopRestartArgvConflictMessage(argv, process.env);
+  if (sharedArgvConflict) throw new Error(sharedArgvConflict);
   const rawIsolatedArg = argv.find((arg) => arg === '--isolated' || arg.startsWith('--isolated='));
   const isolatedArg = resolveIsolatedArg(rawIsolatedArg, rootDir, foldCaseOption(rootDir));
   if (rawIsolatedArg && isolatedArg && isolatedArg !== rawIsolatedArg) {
@@ -1040,6 +1059,9 @@ async function main() {
     throw new Error(
       '--preserve-running reuses the current Cindy login via shared userData and cannot be combined with --isolated or XDT_ISOLATED=1',
     );
+  }
+  if (startupConfig && argv.includes(SHARED_USERDATA_ARG)) {
+    console.log('==> Shared userData mode: dev keeps the legacy shared profile behavior instead of an isolated sandbox.');
   }
   if (startupConfig) {
     console.log(`==> Desktop region: ${startupConfig.region}`);
