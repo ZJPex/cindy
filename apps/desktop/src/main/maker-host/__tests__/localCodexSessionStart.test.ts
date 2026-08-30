@@ -146,13 +146,15 @@ describe('local codex session start preparation', () => {
       dirtyByCwd.has(workingDir || '') ? 1 : null,
     );
     const listAgentSkills = vi.fn(
-      async () => {
+      async (opts: { workingDir?: string; forceReload?: boolean }) => {
+        void opts;
         order.push('force-reload');
         return { skills: [] };
       },
     );
     const markCodexSkillsListCacheReloaded = vi.fn(
-      (workingDir: string | null | undefined) => {
+      (workingDir: string | null | undefined, reloadedEpoch: number) => {
+        void reloadedEpoch;
         dirtyByCwd.delete(workingDir || '');
         order.push('mark-reloaded');
       },
@@ -200,10 +202,14 @@ describe('local codex session start preparation', () => {
       dirtyByCwd.has(workingDir || '') ? 1 : null,
     );
     const listAgentSkills = vi.fn(
-      async () => ({ skills: [] }),
+      async (opts: { workingDir?: string; forceReload?: boolean }) => {
+        void opts;
+        return { skills: [] };
+      },
     );
     const markCodexSkillsListCacheReloaded = vi.fn(
-      (workingDir: string | null | undefined) => {
+      (workingDir: string | null | undefined, reloadedEpoch: number) => {
+        void reloadedEpoch;
         dirtyByCwd.delete(workingDir || '');
       },
     );
