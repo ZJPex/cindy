@@ -216,12 +216,10 @@ async function collectOwnerApprovedGhostSkills(
 
   const ghosts = [...source.ghosts].sort((a, b) => a.manifest.id.localeCompare(b.manifest.id));
   for (const ghost of ghosts) {
-    const manifestSlots = Array.isArray(ghost.manifest.slots) ? ghost.manifest.slots : [];
     if (
       !ghost.enabled ||
       ghost.approval.state !== 'approved' ||
       !ghost.approvedSkillRoot ||
-      !manifestSlots.includes('skill') ||
       !ghost.manifest.skill
     ) {
       continue;
@@ -586,8 +584,15 @@ export async function readCodexAgentsProjectionIdentity(
   const paths = codexGlobalSkillsPaths(codexHome, homeDir);
   if (!(await isDirectory(paths.sharedAgentsSkillsDir))) return null;
 
-  const linkStat = await fsp.lstat(paths.sharedAgentsSkillsLink).catch(() => null);
-  if (!linkStat?.isSymbolicLink()) return undefined;
+  let linkStat: Awaited<ReturnType<typeof fsp.lstat>>;
+  try {
+    linkStat = await fsp.lstat(paths.sharedAgentsSkillsLink);
+  } catch (error) {
+    // 共享源已存在但 primary 尚未发布链接，是一个可确认的“暂无投影”状态；
+    // 与冲突文件、权限错误或损坏链接等不可安全确认的 undefined 分开。
+    return (error as NodeJS.ErrnoException).code === 'ENOENT' ? null : undefined;
+  }
+  if (!linkStat.isSymbolicLink()) return undefined;
 
   const projectionDir = await realPathOrNull(paths.sharedAgentsSkillsLink);
   const projectionRoot = await realPathOrNull(path.join(paths.codexHome, 'skill-projections'));

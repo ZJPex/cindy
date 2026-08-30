@@ -372,6 +372,7 @@ describe('DesktopCodexAuthAdapter asset preparation single-flight', () => {
       ownerScopeKey: 'cloud:owner-a:1',
     };
     harness.rejectSharedMutations = true;
+    harness.codexProjectionIdentity = null;
 
     await expect(runEnsureGlobalCodexAssets.call(adapter, owner)).resolves.toEqual({
       skillsProjectionEpoch: 0,

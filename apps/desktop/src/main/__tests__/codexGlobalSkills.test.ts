@@ -88,7 +88,6 @@ async function writeApprovedGhostSkills(
         version: '1.0.0',
         kind: 'chip',
         entry: 'main.js',
-        slots: ['skill'],
         skill: {
           items: items.map((item) => ({ ...item, description: 'test skill' })),
         },
@@ -433,7 +432,7 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     ).resolves.toEqual([path.join(ownerALink, 'SKILL.md')]);
   });
 
-  it('fails closed when an approved Ghost reports malformed slots', async () => {
+  it('projects approved Ghost Skills from the normalized manifest capability', async () => {
     const root = await makeTmpDir();
     const homeDir = path.join(root, 'home');
     const codexHome = path.join(root, 'xdt-codex-home');
@@ -441,25 +440,21 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     const approved = await writeApprovedGhostSkills(ownerRoot, 'ghost-a', [
       { dir: 'agent-skills/profile-a', name: 'profile-a' },
     ]);
-    const malformedGhost: InstalledGhost = {
-      ...approved.ghost,
-      manifest: {
-        ...approved.ghost.manifest,
-        slots: 'skill',
-      },
-    };
-
     const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+    await fs.mkdir(paths.sharedAgentsSkillsDir, { recursive: true });
     const result = await prepareCodexGlobalSkillsLinks(codexHome, {
       homeDir,
       ownerRoot,
-      approvedGhostSkills: approvedGhostSkills([malformedGhost]),
+      approvedGhostSkills: approvedGhostSkills([approved.ghost]),
     });
 
     expect(result.warnings).toEqual([]);
-    await expect(
-      fs.lstat(path.join(paths.sharedAgentsSkillsLink, 'ghost-a--profile-a')),
-    ).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(
+      await sameRealPath(
+        path.join(paths.sharedAgentsSkillsLink, 'ghost-a--profile-a'),
+        approved.skillDirs.get('profile-a')!,
+      ),
+    ).toBe(true);
   });
 
   it('ignores unrelated ancestor directories containing a managed-link separator', async () => {
@@ -654,6 +649,20 @@ describe('prepareCodexGlobalSkillsLinks', () => {
       approvedGhostSkills: approvedGhostSkills([ownerBApproved.ghost]),
     });
     expect(repeated.changed).toBe(false);
+  });
+
+  it('reports an unpublished agents projection as absent after the shared source appears', async () => {
+    const root = await makeTmpDir();
+    const homeDir = path.join(root, 'home');
+    const codexHome = path.join(root, 'xdt-codex-home');
+    const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+    await fs.mkdir(paths.sharedAgentsSkillsDir, { recursive: true });
+
+    await expect(readCodexAgentsProjectionIdentity(codexHome, homeDir)).resolves.toBeNull();
+    await fs.mkdir(paths.sharedAgentsSkillsLink, { recursive: true });
+    await expect(
+      readCodexAgentsProjectionIdentity(codexHome, homeDir),
+    ).resolves.toBeUndefined();
   });
 
   it('repairs a corrupted content-addressed projection and invalidates cached Skills', async () => {
