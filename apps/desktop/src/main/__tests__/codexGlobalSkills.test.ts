@@ -433,6 +433,35 @@ describe('prepareCodexGlobalSkillsLinks', () => {
     ).resolves.toEqual([path.join(ownerALink, 'SKILL.md')]);
   });
 
+  it('fails closed when an approved Ghost reports malformed slots', async () => {
+    const root = await makeTmpDir();
+    const homeDir = path.join(root, 'home');
+    const codexHome = path.join(root, 'xdt-codex-home');
+    const ownerRoot = path.join(root, 'user-data', 'owners', 'owner-a');
+    const approved = await writeApprovedGhostSkills(ownerRoot, 'ghost-a', [
+      { dir: 'agent-skills/profile-a', name: 'profile-a' },
+    ]);
+    const malformedGhost: InstalledGhost = {
+      ...approved.ghost,
+      manifest: {
+        ...approved.ghost.manifest,
+        slots: 'skill',
+      },
+    };
+
+    const paths = codexGlobalSkillsPaths(codexHome, homeDir);
+    const result = await prepareCodexGlobalSkillsLinks(codexHome, {
+      homeDir,
+      ownerRoot,
+      approvedGhostSkills: approvedGhostSkills([malformedGhost]),
+    });
+
+    expect(result.warnings).toEqual([]);
+    await expect(
+      fs.lstat(path.join(paths.sharedAgentsSkillsLink, 'ghost-a--profile-a')),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('ignores unrelated ancestor directories containing a managed-link separator', async () => {
     const root = await makeTmpDir();
     const misleadingHome = path.join(root, 'home--not-a-ghost-link');

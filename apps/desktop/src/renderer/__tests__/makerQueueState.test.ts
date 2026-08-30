@@ -76,6 +76,8 @@ const state = (overrides: Partial<SessionChatState> = {}): SessionChatState => (
   inputRecovery: null,
   activeTurnRetryText: null,
   errorRetryText: null,
+  errorPersistId: null,
+  disposedErrorPersistId: null,
   credentialSwitchWait: null,
   continuationInFlightClientId: null,
   continuationTurnClientId: null,
@@ -121,6 +123,9 @@ const state = (overrides: Partial<SessionChatState> = {}): SessionChatState => (
   turnStoppedByUser: false,
   lastAgentMeta: null,
   ...overrides,
+  pendingRemoteDesktopConfirmation: overrides.pendingRemoteDesktopConfirmation ?? null,
+  pendingRemoteDesktopConfirmationQueue:
+    overrides.pendingRemoteDesktopConfirmationQueue ?? [],
 });
 
 describe('makerQueueState', () => {

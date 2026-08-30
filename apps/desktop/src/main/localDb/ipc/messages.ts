@@ -7,11 +7,13 @@
  */
 
 import { ipcMain, BrowserWindow } from 'electron';
-import { and, asc, eq, inArray, lt, gt, gte, desc, isNull, or, sql, type SQL } from 'drizzle-orm';
+import { and, asc, eq, inArray, lt, lte, gt, gte, desc, isNull, or, sql, type SQL } from 'drizzle-orm';
 import { createId } from '@paralleldrive/cuid2';
 
 import { getDbClient } from '../client/current';
+import { latestVisiblePreviewRow } from '../latestMessageText';
 import { messages, sessions } from '../schema';
+import { persistSessionListPreview } from '../sessionListProjection';
 import {
   messageToCamel,
   messageCreateToRow,
@@ -46,6 +48,7 @@ import {
   type RegionalMoney,
 } from '../../../shared/regionalMoney.js';
 import { capReferenceMessageRows } from './history.js';
+import { maybeUpgradeCodexHistoryOversizedError } from '../codexHistoryOversizedUpgrade';
 import type { Message, MessageRole, AgentMeta } from '../../../renderer/lib/ccAgent.types';
 
 const log = createLogger('localDb/messages');
@@ -54,6 +57,15 @@ const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
 const MESSAGE_DELETION_USER_BOUNDARY_PAGE_SIZE = 32;
 const messageRowid = sql<number>`rowid`;
+/**
+ * Skip silent-stop autoResume user rows without letting one bad historical
+ * agent_meta blob fail the whole page query. SQLite may evaluate
+ * json_extract even when a sibling OR json_valid(...) = 0 is already true.
+ */
+function notAutoResumeAgentMetaSql() {
+  return sql`(${messages.agentMeta} IS NULL OR CASE WHEN json_valid(${messages.agentMeta}) THEN json_extract(${messages.agentMeta}, '$.autoResume') END IS NOT 1)`;
+}
+
 type MessageRow = typeof messages.$inferSelect;
 type MessageRowWithRowid = MessageRow & { rowid: number };
 type DataOwnerBroadcastScope = ReturnType<typeof broadcastTap.captureDataOwnerBroadcastScope>;
@@ -98,23 +110,92 @@ function ownerStampForBroadcast(
   return getSafeOwnerPushStamp();
 }
 
-// DbClient uses better-sqlite3 `.all()`: never return whole message bodies for
-// retention bookkeeping. JSON1 extracts only the distinct paths that startup
-// cleanup needs, while LIKE avoids invoking json_each for unrelated history.
-const PERSISTED_CHAT_ATTACHMENT_CONTENT_PATTERN = '%chat-attachment-cache%';
-const PERSISTED_CHAT_ATTACHMENT_PATHS_SQL = `SELECT DISTINCT
-         attachment.atom AS filePath
-   FROM messages AS m
-   JOIN sessions AS s ON s.id = m.session_id
-   JOIN json_tree(
-          CASE WHEN json_valid(m.content) THEN m.content ELSE '{}' END,
-          '$.files'
-        ) AS attachment
-  WHERE s.status != 'deleted'
-    AND m.rewind_at IS NULL
-    AND m.content LIKE ?
-    AND attachment.key = 'path'
-    AND attachment.type = 'text'`;
+function broadcastOwnedPayload(
+  channel: string,
+  payload: unknown,
+  ownerScope?: DataOwnerBroadcastScope | null,
+): void {
+  const ownerStamp = ownerStampForBroadcast(ownerScope);
+  if (ownerStamp === null) return;
+  if (ownerScope !== undefined && ownerScope !== null) {
+    broadcastTap.tapWindowBroadcast(channel, payload, ownerStamp);
+  } else if (ownerStamp === undefined) {
+    broadcastTap.tapWindowBroadcast(channel, payload);
+  } else {
+    broadcastTap.tapWindowBroadcast(channel, payload, ownerStamp);
+  }
+  const hasCapturedScope = ownerScope !== undefined && ownerScope !== null;
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue;
+    try {
+      if (hasCapturedScope) {
+        win.webContents.send(channel, payload, ownerStamp);
+      } else if (ownerStamp === undefined) {
+        win.webContents.send(channel, payload);
+      } else {
+        win.webContents.send(channel, payload, ownerStamp);
+      }
+    } catch {
+      /* swallow per-window broadcast failures */
+    }
+  }
+}
+
+function isVisibleSessionListPreviewRow(row: MessageRow): boolean {
+  if (row.role !== 'user' && row.role !== 'assistant') return false;
+  if (row.rewindAt != null) return false;
+  if (row.role === 'user' && isAutoResumeUserRow(row.agentMeta)) return false;
+  return true;
+}
+
+/**
+ * 可见 user/assistant 落库后立刻刷新侧栏 preview,不等 turn-done / 全量 reseed。
+ * 只广播当前仍是该会话最近可见消息的那一行:改写旧回复不得盖住已经更新的预览。
+ */
+async function maybeBroadcastSessionListPreview(
+  sessionId: string,
+  row: MessageRow,
+  ownerScope?: DataOwnerBroadcastScope | null,
+): Promise<void> {
+  if (!isVisibleSessionListPreviewRow(row)) return;
+  let latest: Awaited<ReturnType<typeof latestVisiblePreviewRow>>;
+  try {
+    latest = await latestVisiblePreviewRow(sessionId);
+  } catch (err) {
+    log.warn('session list preview latest-row check failed (swallowed)', {
+      sessionId,
+      clientId: row.clientId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+  if (latest?.clientId !== row.clientId) return;
+  if (!isOwnerBroadcastScopeCurrent(ownerScope)) return;
+  const preview = extractMessagePreview(row.content, row.role);
+  // 不在这里落库。insert/update 事务已经把 list_preview 置空；事后 persist 无法
+  // 校验同一 clientId 的内容版本，交错改写会把旧正文写回非 NULL 缓存。
+  // 侧栏即时刷新靠广播；下次 list/回填从 messages 现算。
+  broadcastOwnedPayload(
+    'local-db:sessions:patched',
+    { sessionId, patch: { preview } },
+    ownerScope,
+  );
+}
+
+function isAutoResumeUserRow(agentMetaJson: string | null): boolean {
+  if (!agentMetaJson) return false;
+  try {
+    const parsed: unknown = JSON.parse(agentMetaJson);
+    return Boolean(
+      parsed &&
+        typeof parsed === 'object' &&
+        !Array.isArray(parsed) &&
+        (parsed as { autoResume?: unknown }).autoResume === true,
+    );
+  } catch {
+    return false;
+  }
+}
 
 export interface EstimatedSessionValueEntry {
   clientId: string;
@@ -142,15 +223,6 @@ const VALID_ROLES: ReadonlySet<MessageRole> = new Set([
   'plan_review',
   'thinking',
 ] as const);
-
-/** Return all staged attachment paths retained by the current owner's message DB. */
-export async function listPersistedChatAttachmentPaths(): Promise<string[]> {
-  const rows = await getDbClient().query<{ filePath: unknown }>(
-    PERSISTED_CHAT_ATTACHMENT_PATHS_SQL,
-    [PERSISTED_CHAT_ATTACHMENT_CONTENT_PATTERN],
-  );
-  return rows.flatMap((row) => (typeof row.filePath === 'string' ? [row.filePath] : []));
-}
 
 export function registerMessageIpc(): void {
   ipcMain.handle('local-db:messages:list', async (_e, sessionId: unknown, opts: unknown) => {
@@ -242,7 +314,24 @@ export function registerMessageIpc(): void {
       )
       .limit(limit);
     const orderedRows = afterCursor ? rows.slice().reverse() : rows;
-    return hydrateLegacyUserTurnCosts(orderedRows.map(messageToCamelWithRowid));
+    const listed = hydrateLegacyUserTurnCosts(orderedRows.map(messageToCamelWithRowid));
+    // 不阻塞首屏。旧 reconnect-stalled 横幅只在首页扫描一次，分页不再读 rollout。
+    if (!before && beforeTs == null && !after) {
+      const ownerScope = captureOwnerBroadcastScope();
+      void maybeUpgradeCodexHistoryOversizedError(sid)
+        .then((upgrade) => {
+          if (upgrade.result !== 'upgraded' || !upgrade.message) return;
+          if (!isOwnerBroadcastScopeCurrent(ownerScope)) return;
+          broadcastMessageRow(sid, upgrade.message, ownerScope);
+        })
+        .catch((error) => {
+          log.warn('codex oversized history upgrade rejected', {
+            sessionId: sid,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+    }
+    return listed;
   });
 
   ipcMain.handle(
@@ -532,6 +621,10 @@ export function registerMessageIpc(): void {
     async (_e, sessionId: unknown, clientId: unknown) => {
       const sid = requireString(sessionId, 'sessionId');
       const cid = requireString(clientId, 'clientId');
+      // 动态 import:messagePersistBroadcaster 已静态依赖本模块 createMessage,
+      // 静态反向 import 会成环。落库前点关闭/重试时先等同一 persistId 写完。
+      const { whenTurnErrorPersisted } = await import('../../messagePersistBroadcaster.js');
+      await whenTurnErrorPersisted(sid, cid);
       const msg = await dismissErrorMessage(sid, cid);
       if (!msg) throwIpcError('NOT_FOUND', 'Error message 不存在');
       return msg;
@@ -612,38 +705,7 @@ export function broadcastMessageRow(
   msg: Message,
   ownerScope?: DataOwnerBroadcastScope | null,
 ): void {
-  const ownerStamp = ownerStampForBroadcast(ownerScope);
-  if (ownerStamp === null) return;
-  if (ownerScope !== undefined && ownerScope !== null) {
-    broadcastTap.tapWindowBroadcast(
-      'local-db:messages:created',
-      { sessionId, message: msg },
-      ownerStamp,
-    );
-  } else if (ownerStamp === undefined) {
-    broadcastTap.tapWindowBroadcast('local-db:messages:created', { sessionId, message: msg });
-  } else {
-    broadcastTap.tapWindowBroadcast(
-      'local-db:messages:created',
-      { sessionId, message: msg },
-      ownerStamp,
-    );
-  }
-  const hasCapturedScope = ownerScope !== undefined && ownerScope !== null;
-  for (const win of BrowserWindow.getAllWindows()) {
-    if (win.isDestroyed()) continue;
-    try {
-      if (hasCapturedScope) {
-        win.webContents.send('local-db:messages:created', { sessionId, message: msg }, ownerStamp);
-      } else if (ownerStamp === undefined) {
-        win.webContents.send('local-db:messages:created', { sessionId, message: msg });
-      } else {
-        win.webContents.send('local-db:messages:created', { sessionId, message: msg }, ownerStamp);
-      }
-    } catch {
-      /* swallow per-window broadcast failures */
-    }
-  }
+  broadcastOwnedPayload('local-db:messages:created', { sessionId, message: msg }, ownerScope);
 }
 
 export interface MessageDeletedPayload {
@@ -894,7 +956,7 @@ export async function commitMessageDeletion(
   // agentMeta.autoResume / cleared_at。
   //
   // 刻意**不**广播 `_count.messages`：列表里 `_count.messages` 的权威口径是该会话的全部
-  // messages 行数（sessions.ts 的 SESSION_MESSAGE_COUNT_SQL / MESSAGE_COUNT_COL，不过滤
+  // messages 行数（sessions.ts 的 SESSION_MESSAGE_COUNT_SQL，不过滤
   // role / rewind_at / cleared_at），而下面这个可见投影只数 user/assistant 行——一个正常
   // 会话里 tool_use / tool_result / thinking / error 行往往是它的几十倍，拿它去 patch 会把
   // 侧栏与手机端卡片的「N 条消息」改成明显偏小的值，且 shallow merge 消费端不会自己纠正，
@@ -910,31 +972,18 @@ export async function commitMessageDeletion(
   // 口径要动得连 maker-shared/sessionList 的 messageCountLabel 一起改。
   let preview: string | null = null;
   try {
-    const db = getDbClient().drizzle;
-    const [sessionRow] = await db
-      .select({ clearedAt: sessions.clearedAt })
-      .from(sessions)
-      .where(eq(sessions.id, sessionId))
-      .limit(1);
-    const visibleAfterClear =
-      sessionRow?.clearedAt == null ? undefined : gt(messages.createdAt, sessionRow.clearedAt);
-    const visibleMessageProjection = and(
-      eq(messages.sessionId, sessionId),
-      sql`${messages.role} IN ('user', 'assistant')`,
-      isNull(messages.rewindAt),
-      sql`(${messages.agentMeta} IS NULL OR json_extract(${messages.agentMeta}, '$.autoResume') IS NOT 1)`,
-      visibleAfterClear,
+    const latest = await latestVisiblePreviewRow(sessionId);
+    preview = extractMessagePreview(latest?.content, latest?.role);
+    await persistSessionListPreview(
+      sessionId,
+      preview,
+      latest?.role ?? null,
+      latest?.createdAt,
+      latest?.clientId,
     );
-    const [latestRow] = await db
-      .select({ content: messages.content, role: messages.role })
-      .from(messages)
-      .where(visibleMessageProjection)
-      .orderBy(desc(messages.createdAt), desc(messageRowid))
-      .limit(1);
-    preview = extractMessagePreview(latestRow?.content, latestRow?.role);
   } catch (error) {
-    // 删除已经原子提交；投影查询失败不能把成功操作伪装成失败。广播保守空值，
-    // 后续 sessions:list / reseed 会按 DB 真相收敛。
+    // 删除已经原子提交；message.delete 事务已把 list_preview / role / count 置 NULL，
+    // 投影刷新失败不能把成功操作伪装成失败。广播保守空值，list 回落子查询。
     log.warn('message delete session projection refresh failed', {
       sessionId,
       deletedClientIds: clientIds,
@@ -1083,15 +1132,11 @@ export async function rewindPersistedUserMessageAfterClear(
   if (!row) return;
 
   const rewoundAt = Date.now();
-  const updated = await dbClient.exec(
-    `UPDATE messages
-        SET rewind_at = ?
-      WHERE session_id = ?
-        AND client_id = ?
-        AND role = 'user'
-        AND rewind_at IS NULL`,
-    [rewoundAt, sessionId, clientId],
-  );
+  const updated = await dbClient.tx('message.rewindUserAfterClear', {
+    sessionId,
+    clientId,
+    rewoundAt,
+  });
   if (!isOwnerBroadcastScopeCurrent(ownerScope)) return;
   if (updated.changes === 0) return;
 
@@ -1254,16 +1299,34 @@ export async function updateMessageContent(
   clientId: string,
   content: unknown,
 ): Promise<Message | null> {
-  const db = getDbClient().drizzle;
-  await db
-    .update(messages)
-    .set({ content: safeStringify(content) })
-    .where(and(eq(messages.sessionId, sessionId), eq(messages.clientId, clientId)));
-  const [row] = await db
-    .select()
+  const ownerScope = captureOwnerBroadcastScope();
+  const dbClient = getDbClient();
+  const db = dbClient.drizzle;
+  const serialized = safeStringify(content);
+  await dbClient.tx('message.updateContent', {
+    sessionId,
+    clientId,
+    content: serialized,
+  });
+  // 窄回读:刻意不选 content——tool_result 全文可达 MB 级,整行回读会把大字段
+  // 经 DB worker 的 postMessage 结构化克隆再送回主进程一次。content 就是本次
+  // 写入值,用 serialized 回填;行不存在(clientId 未落库)仍以回读判 null。
+  const [narrow] = await db
+    .select({
+      id: messages.id,
+      clientId: messages.clientId,
+      sessionId: messages.sessionId,
+      role: messages.role,
+      toolUseId: messages.toolUseId,
+      agentMeta: messages.agentMeta,
+      agentKind: messages.agentKind,
+      createdAt: messages.createdAt,
+      rewindAt: messages.rewindAt,
+    })
     .from(messages)
     .where(and(eq(messages.sessionId, sessionId), eq(messages.clientId, clientId)))
     .limit(1);
+  const row: MessageRow | undefined = narrow ? { ...narrow, content: serialized } : undefined;
   if (row) {
     // 挂账钩子同样覆盖"先摘要 create、后全文 update"的 tool_result 顺序
     // (review P2:vendor 事件顺序一变,首现于 update 的 blob URL 若不在这里
@@ -1279,6 +1342,7 @@ export async function updateMessageContent(
         error: err instanceof Error ? err.message : String(err),
       });
     });
+    await maybeBroadcastSessionListPreview(sessionId, row, ownerScope);
   }
   return row ? messageToCamel(row) : null;
 }
@@ -1418,35 +1482,20 @@ export async function createMessage(
       : (body.createdAt ?? now);
   const insertRow = messageCreateToRow(id, sessionId, body, visibleCreatedAt);
   try {
-    if (guarded) {
-      // Keep the session compare and message insert in one SQLite statement.
-      // A separate SELECT would allow /clear to win between the check and the
-      // INSERT on the DB worker.
-      const inserted = await dbClient.exec(
-        `INSERT INTO messages (
-           id, client_id, session_id, role, content, tool_use_id,
-           agent_meta, agent_kind, created_at
-         )
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
-           FROM sessions AS s
-          WHERE s.id = ?
-            AND COALESCE(s.cleared_at, -1) = COALESCE(?, -1)
-         ON CONFLICT(session_id, client_id) DO NOTHING`,
-        [
-          insertRow.id,
-          insertRow.clientId,
-          insertRow.sessionId,
-          insertRow.role,
-          insertRow.content,
-          insertRow.toolUseId,
-          insertRow.agentMeta,
-          insertRow.agentKind,
-          insertRow.createdAt,
-          sessionId,
-          expected,
-        ],
-      );
-      if (inserted.changes === 0) {
+    const inserted = await dbClient.tx('message.insert', {
+      id: insertRow.id,
+      clientId: insertRow.clientId,
+      sessionId,
+      role: insertRow.role,
+      content: insertRow.content,
+      toolUseId: insertRow.toolUseId ?? null,
+      agentMeta: insertRow.agentMeta ?? null,
+      agentKind: insertRow.agentKind ?? null,
+      createdAt: insertRow.createdAt,
+      guarded,
+      expectedClearBoundaryMs: guarded ? (expected ?? null) : undefined,
+    });
+    if (guarded && inserted.changes === 0) {
         const [existingAfterGuard] = await db
           .select()
           .from(messages)
@@ -1476,9 +1525,6 @@ export async function createMessage(
         }
         throw new Error('Message insert skipped without a clear-boundary change');
       }
-    } else {
-      await db.insert(messages).values(insertRow);
-    }
   } catch (err) {
     const after = await db
       .select()
@@ -1514,8 +1560,23 @@ export async function createMessage(
     }
     throw err;
   }
-  const [row] = await db.select().from(messages).where(eq(messages.id, id));
-  if (!row) throw new Error('Message 创建后查询失败');
+  // 插入成功后不再整行回读:大 content(tool_result 全文)会经 DB worker 的
+  // postMessage 再送回主进程一次。insertRow 就是刚写入的行(新行 rewind_at 恒
+  // NULL);必须过 messageToCamel 走与回读完全相同的解析路径(JSON.parse 失败
+  // 回退裸串、assistant 引文剥离),否则返回值/广播行的类型语义会漂移。幂等命中
+  // 与 UNIQUE / guarded 回退路径仍保留各自的回读(上方),不受影响。
+  const row: MessageRow = {
+    id: insertRow.id,
+    clientId: insertRow.clientId,
+    sessionId: insertRow.sessionId,
+    role: insertRow.role,
+    content: insertRow.content,
+    toolUseId: insertRow.toolUseId ?? null,
+    agentMeta: insertRow.agentMeta ?? null,
+    agentKind: insertRow.agentKind ?? null,
+    createdAt: insertRow.createdAt,
+    rewindAt: null,
+  };
   const msg = messageToCamel(row);
   // 媒体总仓挂账钩子(规则 25):消息落库是"blob 归属本会话"的
   // 确定时点,覆盖所有落库来源(renderer IPC / hook / im / agent echo / 合成
@@ -1554,6 +1615,7 @@ export async function createMessage(
   // 主动 push 过, 监听端按 (sessionId, clientId) dedupe 就不会重复显示。
   if (opts?.shouldBroadcast?.() !== false) {
     broadcastMessageRow(sessionId, msg, opts?.broadcastOwnerScope);
+    await maybeBroadcastSessionListPreview(sessionId, row, opts?.broadcastOwnerScope);
   }
   // chat-history-embedder hook (Phase 1.2) —— fire-and-forget, 不 await。
   // 内部已有 enabled / cutoff / role / size 守卫; 关闭状态下零成本直接 return。
@@ -1862,6 +1924,10 @@ export async function readPriorUserRoundCost(
  * correct user-round total without rewriting legacy data or changing the raw
  * segment values used by every billing aggregate. New messages already carry
  * the persisted field and skip this path.
+ *
+ * Scan only from the oldest row on this page back to the previous real user
+ * boundary. A full-session walk here used to re-read tens of thousands of
+ * agent_meta blobs on every history page.
  */
 async function hydrateLegacyUserTurnCosts(history: Message[]): Promise<Message[]> {
   const legacyClientIds = new Set(
@@ -1883,6 +1949,9 @@ async function hydrateLegacyUserTurnCosts(history: Message[]): Promise<Message[]
 
   const sessionId = history[0]?.sessionId;
   if (!sessionId) return history;
+  const oldestOnPage = oldestHistoryMessage(history);
+  const oldestCreatedAtMs = Date.parse(oldestOnPage.createdAt);
+  if (!Number.isFinite(oldestCreatedAtMs)) return history;
   const db = getDbClient().drizzle;
   const [session] = await db
     .select({ clearedAt: sessions.clearedAt })
@@ -1891,6 +1960,47 @@ async function hydrateLegacyUserTurnCosts(history: Message[]): Promise<Message[]
     .limit(1);
   const visibleAfterClear =
     session?.clearedAt == null ? [] : [gt(messages.createdAt, session.clearedAt)];
+  const olderThanOldestOnPage =
+    oldestOnPage.rowid != null
+      ? or(
+          lt(messages.createdAt, oldestCreatedAtMs),
+          and(eq(messages.createdAt, oldestCreatedAtMs), lt(messageRowid, oldestOnPage.rowid)),
+        )
+      : lt(messages.createdAt, oldestCreatedAtMs);
+  const priorUser = await db
+    .select({
+      createdAt: messages.createdAt,
+      rowid: messageRowid,
+    })
+    .from(messages)
+    .where(
+      and(
+        eq(messages.sessionId, sessionId),
+        eq(messages.role, 'user'),
+        isNull(messages.rewindAt),
+        ...visibleAfterClear,
+        olderThanOldestOnPage,
+        notAutoResumeAgentMetaSql(),
+      ),
+    )
+    .orderBy(desc(messages.createdAt), desc(messageRowid))
+    .limit(1);
+  const newestOnPage = newestHistoryMessage(history);
+  const newestCreatedAtMs = Date.parse(newestOnPage.createdAt);
+  const fromPriorUser = priorUser[0]
+    ? or(
+        gt(messages.createdAt, priorUser[0].createdAt),
+        and(eq(messages.createdAt, priorUser[0].createdAt), gte(messageRowid, priorUser[0].rowid)),
+      )
+    : undefined;
+  const throughNewestOnPage = Number.isFinite(newestCreatedAtMs)
+    ? newestOnPage.rowid != null
+      ? or(
+          lt(messages.createdAt, newestCreatedAtMs),
+          and(eq(messages.createdAt, newestCreatedAtMs), lte(messageRowid, newestOnPage.rowid)),
+        )
+      : lte(messages.createdAt, newestCreatedAtMs)
+    : undefined;
   const rows = await db
     .select({
       clientId: messages.clientId,
@@ -1898,7 +2008,15 @@ async function hydrateLegacyUserTurnCosts(history: Message[]): Promise<Message[]
       agentMeta: messages.agentMeta,
     })
     .from(messages)
-    .where(and(eq(messages.sessionId, sessionId), isNull(messages.rewindAt), ...visibleAfterClear))
+    .where(
+      and(
+        eq(messages.sessionId, sessionId),
+        isNull(messages.rewindAt),
+        ...visibleAfterClear,
+        ...(fromPriorUser ? [fromPriorUser] : []),
+        ...(throughNewestOnPage ? [throughNewestOnPage] : []),
+      ),
+    )
     .orderBy(asc(messages.createdAt), asc(messageRowid));
 
   const totalsByClientId = new Map<string, PriorUserRoundCost>();
@@ -1968,6 +2086,29 @@ async function hydrateLegacyUserTurnCosts(history: Message[]): Promise<Message[]
 
 function isAutoResumeUserMessage(agentMeta: string | null): boolean {
   return parseAgentMetaRecord(agentMeta)?.autoResume === true;
+}
+
+function oldestHistoryMessage(history: Message[]): Message {
+  return history.reduce((oldest, message) =>
+    compareHistoryTimeline(message, oldest) < 0 ? message : oldest,
+  );
+}
+
+function newestHistoryMessage(history: Message[]): Message {
+  return history.reduce((newest, message) =>
+    compareHistoryTimeline(message, newest) > 0 ? message : newest,
+  );
+}
+
+function compareHistoryTimeline(a: Message, b: Message): number {
+  const timeDiff = Date.parse(a.createdAt) - Date.parse(b.createdAt);
+  if (Number.isFinite(timeDiff) && timeDiff !== 0) return timeDiff;
+  const aRowid = typeof a.rowid === 'number' ? a.rowid : Number.NaN;
+  const bRowid = typeof b.rowid === 'number' ? b.rowid : Number.NaN;
+  if (Number.isFinite(aRowid) && Number.isFinite(bRowid) && aRowid !== bRowid) {
+    return aRowid - bRowid;
+  }
+  return 0;
 }
 
 /** DB content 可为 JSON string、含 text 的对象，或迁移前遗留的裸文本。 */

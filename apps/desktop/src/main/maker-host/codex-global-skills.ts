@@ -216,11 +216,12 @@ async function collectOwnerApprovedGhostSkills(
 
   const ghosts = [...source.ghosts].sort((a, b) => a.manifest.id.localeCompare(b.manifest.id));
   for (const ghost of ghosts) {
+    const manifestSlots = Array.isArray(ghost.manifest.slots) ? ghost.manifest.slots : [];
     if (
       !ghost.enabled ||
       ghost.approval.state !== 'approved' ||
       !ghost.approvedSkillRoot ||
-      !ghost.manifest.slots.includes('skill') ||
+      !manifestSlots.includes('skill') ||
       !ghost.manifest.skill
     ) {
       continue;

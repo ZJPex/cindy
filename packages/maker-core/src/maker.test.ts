@@ -91,6 +91,19 @@ describe('Maker agent status', () => {
       authReady: false,
     });
   });
+
+  it('registers an optional agent after construction idempotently', () => {
+    const maker = new Maker({
+      agents: {},
+      storage: createStorage(),
+      logger: createLogger(),
+    });
+    const pi = createAgent(async () => undefined, 'pi');
+
+    expect(maker.registerAgent('pi', pi)).toBe(true);
+    expect(maker.registerAgent('pi', pi)).toBe(false);
+    expect(maker.listAvailableAgents()).toEqual(['pi']);
+  });
 });
 
 function createAgent(
@@ -445,6 +458,40 @@ describe('Maker session creation singleflight', () => {
     expect(close).toHaveBeenCalledTimes(2);
     expect(session.getStatus()).toBe('closed');
     expect(maker.listActiveSessions()).toEqual([]);
+  });
+
+  it('reports which sessions failed to detach instead of resolving as if none did', async () => {
+    // The caller that matters is the account boundary: it hands the runtime to
+    // a different owner right after this resolves. A PI session whose detach
+    // threw may still have a live process owning durable children that hold
+    // credentials the outgoing account cannot revoke, so "shutdown resolved"
+    // was never the same statement as "nothing survived".
+    const failing = createHandle({ id: 'stuck-pi-thread', agentKind: 'pi' });
+    failing.close = vi.fn(async () => { throw new Error('termination unconfirmed'); });
+    const clean = createHandle({ id: 'clean-claude-thread', agentKind: 'claude-code' });
+    const maker = new Maker({
+      agents: {
+        pi: createAgent(async () => failing, 'pi'),
+        'claude-code': createAgent(async () => clean, 'claude-code'),
+      },
+      storage: createStorage(),
+      logger: createLogger(),
+    });
+    await maker.createSession({
+      id: 'session-detach-report-pi', agentKind: 'pi', workingDir: '/repo', model: 'pi-model',
+    });
+    await maker.createSession({
+      id: 'session-detach-report-cc', agentKind: 'claude-code', workingDir: '/repo', model: 'cc-model',
+    });
+
+    const report = await maker.shutdown();
+
+    expect(report.sessionFailures).toHaveLength(1);
+    expect(report.sessionFailures[0]).toMatchObject({
+      sessionId: 'session-detach-report-pi',
+      agentKind: 'pi',
+    });
+    expect((report.sessionFailures[0]!.error as Error).message).toMatch(/termination unconfirmed/);
   });
 
   it('detaches active sessions before the creation barrier and reclaims late publications', async () => {
