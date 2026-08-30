@@ -2006,7 +2006,10 @@ describe('PiAgent.startSession failure cleanup (mocked pi process)', () => {
 
     let releasePrompt!: () => void;
     knobs.promptGate = new Promise<void>((resolve) => { releasePrompt = resolve; });
-    const sending = handle.send({ type: 'user', content: 'Queue the next turn.' });
+    const sending = handle.send({
+      type: 'user',
+      content: '/allow-repetitive-output\nQueue the next turn.',
+    });
     await vi.waitFor(() => expect(knobs.requests.filter((type) => type === 'prompt')).toHaveLength(1));
 
     knobs.requests = [];
@@ -2020,7 +2023,8 @@ describe('PiAgent.startSession failure cleanup (mocked pi process)', () => {
     knobs.onEvent?.({ type: 'agent_start' });
     releasePrompt();
     await sending;
-    await Promise.resolve();
+    emitConfirmedDegenerateMessage();
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
     expect(knobs.requests).not.toContain('abort');
 
     await handle.close();

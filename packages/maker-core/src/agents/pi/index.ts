@@ -3726,7 +3726,6 @@ export class PiAgent extends BaseAgent {
         // prompt/compact/model 控制共用的串行链；排队期间 turn 已推进就直接忽略，
         // 防止迟到的止损误杀下一轮合法输出。
         const detectedTurnGeneration = ctx.turnGeneration;
-        clearPendingOutputDegenerationBypasses();
         return runExclusivePiRpc(async () => {
           if (
             proc.isClosed
@@ -3748,7 +3747,13 @@ export class PiAgent extends BaseAgent {
           if (ctx.turnGeneration !== detectedTurnGeneration) {
             return { success: true, ignored: true };
           }
-          if (!response.success) rollbackPiHostAbortRequest(ctx, hostAbortToken);
+          if (response.success) {
+            // 仅在 Pi 确认仍由原 turn 接受 abort 后丢弃随该 turn 一并取消的 follow-up
+            // reservations。排队期间若下一轮已开始，generation fence 会保留它自己的放行。
+            clearPendingOutputDegenerationBypasses();
+          } else {
+            rollbackPiHostAbortRequest(ctx, hostAbortToken);
+          }
           return response;
         });
       },
