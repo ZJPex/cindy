@@ -5722,7 +5722,6 @@ export class PiAgent extends BaseAgent {
 
       async requestGracefulStop(): Promise<void> {
         if (proc.isClosed) throw new Error('No active Pi turn to stop');
-        clearPendingOutputDegenerationBypasses();
         const hostAbortToken = markPiHostAbortRequested(ctx);
         dismissAllPendingPrompts('turn_aborted', 'deny');
         let resp: Awaited<ReturnType<typeof proc.request>>;
@@ -5736,12 +5735,12 @@ export class PiAgent extends BaseAgent {
           rollbackPiHostAbortRequest(ctx, hostAbortToken);
           throw new Error(`Pi graceful stop rejected: ${resp.error ?? 'unknown'}`);
         }
+        clearPendingOutputDegenerationBypasses();
         clearActiveTurnPermissionPolicy('turn_aborted');
       },
 
       async abort(): Promise<void> {
         if (proc.isClosed) return;
-        clearPendingOutputDegenerationBypasses();
         const hostAbortToken = markPiHostAbortRequested(ctx);
         // 先把等待中的调用 fail-closed 唤醒；即使 abort RPC 失败，也不能让用户刚拒绝/
         // 停止的那次工具继续等一张已失效的卡。policy 仅在 Pi 确认接受 abort 后清空，
@@ -5750,6 +5749,7 @@ export class PiAgent extends BaseAgent {
         try {
           const resp = await proc.request({ type: 'abort' });
           if (resp.success) {
+            clearPendingOutputDegenerationBypasses();
             clearActiveTurnPermissionPolicy('turn_aborted');
           } else {
             rollbackPiHostAbortRequest(ctx, hostAbortToken);

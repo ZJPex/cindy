@@ -22,6 +22,7 @@ const knobs = vi.hoisted(() => ({
   ctorThrows: false,
   getStateRejects: false,
   abortRejects: false,
+  abortThrows: false,
   getStateGate: null as Promise<void> | null,
   promptGate: null as Promise<void> | null,
   closeRejects: false,
@@ -90,6 +91,9 @@ vi.mock('../rpc-client.js', () => ({
       if (cmd.type === 'abort' && knobs.abortRejects) {
         return { success: false, error: 'abort rejected (mock)' };
       }
+      if (cmd.type === 'abort' && knobs.abortThrows) {
+        throw new Error('abort transport failed (mock)');
+      }
       // switch_session / set_thinking_level / set_auto_compaction / get_entries 等一律成功。
       return { success: true, data: { entries: [] } };
     }
@@ -137,6 +141,7 @@ describe('PiAgent.startSession failure cleanup (mocked pi process)', () => {
     knobs.ctorThrows = false;
     knobs.getStateRejects = false;
     knobs.abortRejects = false;
+    knobs.abortThrows = false;
     knobs.getStateGate = null;
     knobs.promptGate = null;
     knobs.closeRejects = false;
@@ -2062,6 +2067,54 @@ describe('PiAgent.startSession failure cleanup (mocked pi process)', () => {
       knobs.onEvent?.({ type: 'agent_start' });
       emitConfirmedDegenerateMessage();
       await vi.waitFor(() => expect(knobs.requests.filter((type) => type === 'abort')).toHaveLength(1));
+
+      await handle.close();
+    },
+  );
+
+  it.each([
+    ['abort', 'is rejected'],
+    ['abort', 'throws'],
+    ['graceful-stop', 'is rejected'],
+    ['graceful-stop', 'throws'],
+  ] as const)(
+    'keeps queued output-degeneration bypasses when %s %s',
+    async (stopMethod, failureMode) => {
+      const deepSeekModel = 'DeepSeek-V4-Flash-0731';
+      const handle = await new PiAgent(buildDeps({
+        capabilityAdditions: {
+          availableModels: [{
+            id: deepSeekModel,
+            displayName: deepSeekModel,
+            contextWindow: 200_000,
+            efforts: [],
+            defaultEffort: null,
+          }],
+        },
+      })).startSession({ ...opts(), model: deepSeekModel });
+
+      knobs.onEvent?.({ type: 'agent_start' });
+      await handle.send({
+        type: 'user',
+        content: '/allow-repetitive-output\nQueue a bypassed follow-up.',
+      });
+      knobs.abortRejects = failureMode === 'is rejected';
+      knobs.abortThrows = failureMode === 'throws';
+
+      if (stopMethod === 'abort') {
+        await expect(handle.abort()).resolves.toBeUndefined();
+      } else {
+        await expect(handle.requestGracefulStop?.()).rejects.toThrow();
+      }
+
+      knobs.abortRejects = false;
+      knobs.abortThrows = false;
+      knobs.onEvent?.({ type: 'agent_settled' });
+      knobs.requests = [];
+      knobs.onEvent?.({ type: 'agent_start' });
+      emitConfirmedDegenerateMessage();
+      await new Promise<void>((resolve) => { setImmediate(resolve); });
+      expect(knobs.requests).not.toContain('abort');
 
       await handle.close();
     },

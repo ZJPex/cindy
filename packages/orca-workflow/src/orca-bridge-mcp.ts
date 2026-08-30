@@ -426,9 +426,13 @@ function captureSessionOutput(
   entry.lastEventAt = Date.now();
   if (ev.type === 'status') {
     const isRunning = (ev.data as { isRunning?: unknown } | null)?.isRunning;
-    // send_to_lead 之外也能从 UI 等入口开启新 turn。仅在上一轮已终止时清空，
-    // 避免同一轮后续的 Thinking / tool running 状态误删已经捕获的正文。
-    if (isRunning === true && entry.status !== 'running') {
+    // send_to_lead 之外也能从 UI 等入口开启新 turn。仅在上一轮已终止且收到前台
+    // running 状态时清空；后台压缩等状态不属于新的产品 turn。
+    if (
+      ev.turnScope !== 'background'
+      && isRunning === true
+      && entry.status !== 'running'
+    ) {
       entry.finalText = '';
       entry.status = 'running';
     }
